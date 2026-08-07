@@ -1,0 +1,33 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+
+# 本地数据与配置（敏感，不上传）
+data/
+plugin_data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env
+.env.*
+
+# 密钥与凭据
+*.pem
+*.key
+*.p12
+*.cer
+id_rsa*
+id_ed25519*
+*.token
+*secret*
+
+# 编辑器
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db

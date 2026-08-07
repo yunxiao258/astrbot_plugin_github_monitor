@@ -1,0 +1,52 @@
+{
+  "enable_auto_check": {
+    "description": "是否启用定时自动检查",
+    "type": "bool",
+    "default": true
+  },
+  "check_interval_minutes": {
+    "description": "定时自动检查间隔（分钟）",
+    "type": "int",
+    "default": 5
+  },
+  "github_token": {
+    "description": "GitHub Personal Access Token（可留空；用于访问私有仓库与提高 API 限额，也可用 /gh settoken 指令设置）",
+    "type": "string",
+    "default": ""
+  },
+  "default_repos": {
+    "description": "默认监控的仓库列表，格式 owner/repo，多个用英文逗号分隔；运行中可用 /gh add 动态添加",
+    "type": "string",
+    "default": "yunxiao258/astrbot_plugin_context_analyzer"
+  },
+  "default_owner": {
+    "description": "未配置 Token 时，/gh repos 查询该用户的公开仓库",
+    "type": "string",
+    "default": "yunxiao258"
+  },
+  "default_subscribers": {
+    "description": "默认订阅推送的会话（unified_msg_origin，如 aiocqhttp:GroupMessage:群号），多个用英文逗号分隔；留空则使用过指令的会话自动订阅",
+    "type": "string",
+    "default": ""
+  },
+  "max_events_per_check": {
+    "description": "每次检查每个仓库最多通知的更新条数（超出折叠提示）",
+    "type": "int",
+    "default": 5
+  },
+  "show_commit_stats": {
+    "description": "是否显示提交的变更文件统计（会为每个新提交额外调用一次 GitHub API）",
+    "type": "bool",
+    "default": true
+  },
+  "notify_release": {
+    "description": "是否通知新版本发布（release）",
+    "type": "bool",
+    "default": true
+  },
+  "notify_tag": {
+    "description": "是否通知新标签（tag）",
+    "type": "bool",
+    "default": true
+  }
+}
