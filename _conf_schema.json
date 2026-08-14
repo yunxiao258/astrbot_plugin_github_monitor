@@ -44,6 +44,16 @@
     "type": "bool",
     "default": true
   },
+  "notify_issue": {
+    "description": "是否通知新 Issue",
+    "type": "bool",
+    "default": true
+  },
+  "notify_pr": {
+    "description": "是否通知新 Pull Request",
+    "type": "bool",
+    "default": true
+  },
   "notify_tag": {
     "description": "是否通知新标签（tag）",
     "type": "bool",

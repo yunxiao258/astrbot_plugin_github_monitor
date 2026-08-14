@@ -33,6 +33,8 @@ _SUMMARY_SEM = asyncio.Semaphore(2)
 _FETCH_PER_PAGE = 30
 # 仓库信息（星标数）缓存 TTL（秒）
 _REPO_INFO_TTL = 600
+# Issue/PR 拉取条数：issue/pr 动态远多于提交，10 条足够且省 API 配额
+_ISSUE_PER_PAGE = 10
 
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION)
@@ -264,6 +266,27 @@ class GitHubMonitorPlugin(Star):
             return data
         return []
 
+    async def _get_issues(self, repo: str, per_page: int = 10) -> list[dict]:
+        """获取仓库最近 issue（按创建时间倒序，不含 PR）"""
+        status, data = await self._gh_request(
+            f"/repos/{repo}/issues",
+            params={"state": "all", "per_page": per_page},
+        )
+        if status == 200 and isinstance(data, list):
+            # issues 端点会混入 PR，pull_request 字段存在即为 PR
+            return [i for i in data if isinstance(i, dict) and not i.get("pull_request")]
+        return []
+
+    async def _get_pulls(self, repo: str, per_page: int = 10) -> list[dict]:
+        """获取仓库最近 PR（按创建时间倒序）"""
+        status, data = await self._gh_request(
+            f"/repos/{repo}/pulls",
+            params={"state": "all", "per_page": per_page},
+        )
+        if status == 200 and isinstance(data, list):
+            return data
+        return []
+
     async def _get_commit_stats(self, repo: str, sha: str) -> tuple[int, int]:
         """获取单个提交的变更统计，返回 (新增行数, 删除行数)"""
         status, data = await self._gh_request(f"/repos/{repo}/commits/{sha}")
@@ -333,6 +356,12 @@ class GitHubMonitorPlugin(Star):
                 elif kind == "release":
                     r = item
                     text = f"{r.get('name') or ''} {r.get('tag_name') or ''} {r.get('body') or ''}"
+                elif kind == "issue":
+                    i = item
+                    text = f"{i.get('title') or ''} {i.get('body') or ''}"
+                elif kind == "pr":
+                    p = item
+                    text = f"{p.get('title') or ''} {p.get('body') or ''}"
                 else:  # tag
                     text = item.get("name", "")
                 if self._matches_keywords(text, keywords):
@@ -378,13 +407,21 @@ class GitHubMonitorPlugin(Star):
             if kind == "commit":
                 commit = item.get("commit", {})
                 text = (commit.get("message") or "").strip()
-            else:  # release
+                hint = "提交"
+            elif kind == "release":
                 text = f"{item.get('name') or ''}\n{item.get('body') or ''}".strip()
+                hint = "版本发布"
+            elif kind == "issue":
+                text = f"{item.get('title') or ''}\n{item.get('body') or ''}".strip()
+                hint = "Issue"
+            elif kind == "pr":
+                text = f"{item.get('title') or ''}\n{item.get('body') or ''}".strip()
+                hint = "Pull Request"
+            else:
+                continue
             if text:
                 try:
-                    summary = await self._summarize(
-                        text, "提交" if kind == "commit" else "版本发布"
-                    )
+                    summary = await self._summarize(text, hint)
                 except Exception:  # noqa: BLE001
                     summary = None
                 if summary:
@@ -403,7 +440,14 @@ class GitHubMonitorPlugin(Star):
         """持锁状态下的检查实现（勿直接调用）"""
         # 仓库状态不存在则创建（/_gh add 之外的首次检查）；删除操作与检查互斥由 _check_lock 保证
         repo_state = self._state.setdefault("repos", {}).setdefault(
-            repo, {"last_commit": "", "last_release": "", "last_tag": ""}
+            repo,
+            {
+                "last_commit": "",
+                "last_release": "",
+                "last_tag": "",
+                "last_issue": 0,
+                "last_pr": 0,
+            },
         )
         initialized = self._state.setdefault("initialized", set())
         max_events = max(1, self._safe_int(self.config.get("max_events_per_check", 5), 5))
@@ -486,6 +530,52 @@ class GitHubMonitorPlugin(Star):
                 else:
                     repo_state["last_tag"] = tags[0].get("name", "")
 
+        # 4. 新 issue
+        if self.config.get("notify_issue", True):
+            issues = await self._get_issues(repo, per_page=_ISSUE_PER_PAGE)
+            if issues:
+                last_issue = self._safe_int(repo_state.get("last_issue", 0), 0)
+                if last_issue:
+                    new_issues = []
+                    for i in issues:
+                        num = self._safe_int(i.get("number", 0), 0)
+                        if num <= last_issue:
+                            break
+                        new_issues.append(i)
+                    if new_issues:
+                        new_issues.reverse()
+                        repo_state["last_issue"] = max(
+                            self._safe_int(issues[0].get("number", 0), 0), last_issue
+                        )
+                        await self._attach_summaries("issue", new_issues)
+                        updates.append({"type": "issue", "items": new_issues})
+                else:
+                    repo_state["last_issue"] = self._safe_int(
+                        issues[0].get("number", 0), 0
+                    )
+
+        # 5. 新 PR
+        if self.config.get("notify_pr", True):
+            pulls = await self._get_pulls(repo, per_page=_ISSUE_PER_PAGE)
+            if pulls:
+                last_pr = self._safe_int(repo_state.get("last_pr", 0), 0)
+                if last_pr:
+                    new_prs = []
+                    for p in pulls:
+                        num = self._safe_int(p.get("number", 0), 0)
+                        if num <= last_pr:
+                            break
+                        new_prs.append(p)
+                    if new_prs:
+                        new_prs.reverse()
+                        repo_state["last_pr"] = max(
+                            self._safe_int(pulls[0].get("number", 0), 0), last_pr
+                        )
+                        await self._attach_summaries("pr", new_prs)
+                        updates.append({"type": "pr", "items": new_prs})
+                else:
+                    repo_state["last_pr"] = self._safe_int(pulls[0].get("number", 0), 0)
+
         # 关键词过滤 + 标记已初始化基线
         updates = self._filter_updates(updates)
         if repo not in initialized:
@@ -556,6 +646,44 @@ class GitHubMonitorPlugin(Star):
                     lines.append(f"🏷️ 标签: {name}")
                     lines.append(f"🎯 指向提交: {sha_short or '未知'}")
                     lines.append(f"🔗 https://github.com/{repo}/tree/{name}")
+                    if idx < len(items):
+                        lines.append("")
+            elif kind == "issue":
+                for idx, i in enumerate(items, 1):
+                    num = i.get("number", "")
+                    title = (i.get("title") or "").strip() or "(无标题)"
+                    state = "✅ 已关闭" if i.get("state") == "closed" else "🟢 进行中"
+                    author = (i.get("user") or {}).get("login", "未知")
+                    created = self._format_time(i.get("created_at"))
+                    lines.append(f"🐛 新 Issue #{num} {state}")
+                    lines.append(f"📝 标题: {title}")
+                    if i.get("_summary"):
+                        lines.append(f"🤖 摘要: {i['_summary']}")
+                    lines.append(f"👤 提出者: {author}")
+                    lines.append(f"🕐 时间: {created}")
+                    lines.append(
+                        f"🔗 {i.get('html_url') or f'https://github.com/{repo}/issues/{num}'}"
+                    )
+                    if idx < len(items):
+                        lines.append("")
+            elif kind == "pr":
+                for idx, p in enumerate(items, 1):
+                    num = p.get("number", "")
+                    title = (p.get("title") or "").strip() or "(无标题)"
+                    state = "✅ 已合并" if p.get("merged") else (
+                        "🔀 待合并" if p.get("state") == "open" else "❌ 已关闭"
+                    )
+                    author = (p.get("user") or {}).get("login", "未知")
+                    created = self._format_time(p.get("created_at"))
+                    lines.append(f"🛠️ 新 PR #{num} {state}")
+                    lines.append(f"📝 标题: {title}")
+                    if p.get("_summary"):
+                        lines.append(f"🤖 摘要: {p['_summary']}")
+                    lines.append(f"👤 作者: {author}")
+                    lines.append(f"🕐 时间: {created}")
+                    lines.append(
+                        f"🔗 {p.get('html_url') or f'https://github.com/{repo}/pull/{num}'}"
+                    )
                     if idx < len(items):
                         lines.append("")
 

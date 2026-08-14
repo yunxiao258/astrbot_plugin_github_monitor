@@ -85,6 +85,14 @@ COMMIT2 = {"sha": "def456", "html_url": "https://github.com/o/r/commit/def456",
            "commit": {"message": "add feature", "author": {"name": "Bob", "date": "2026-08-02T00:00:00Z"}}}
 RELEASE = {"tag_name": "v1.2.0", "name": "v1.2.0", "body": "发布说明", "published_at": "2026-08-03T00:00:00Z", "html_url": "https://github.com/o/r/releases/tag/v1.2.0", "author": {"login": "bob"}}
 TAG = {"name": "v1.1.0", "commit": {"sha": "abc123"}, "html_url": "https://github.com/o/r/tree/v1.1.0"}
+ISSUE1 = {"number": 1, "title": "登录接口超时", "state": "open", "user": {"login": "alice"},
+          "created_at": "2026-08-01T00:00:00Z", "html_url": "https://github.com/o/r/issues/1", "body": "复现步骤…"}
+ISSUE2 = {"number": 2, "title": "支持深色模式", "state": "open", "user": {"login": "bob"},
+          "created_at": "2026-08-02T00:00:00Z", "html_url": "https://github.com/o/r/issues/2", "body": "建议新增…"}
+PR1 = {"number": 11, "title": "修复登录问题", "state": "open", "merged": False, "user": {"login": "carol"},
+       "created_at": "2026-08-02T00:00:00Z", "html_url": "https://github.com/o/r/pull/11", "body": "close #1"}
+PR2 = {"number": 12, "title": "合并深色模式", "state": "closed", "merged": True, "user": {"login": "dave"},
+       "created_at": "2026-08-03T00:00:00Z", "html_url": "https://github.com/o/r/pull/12", "body": "close #2"}
 
 
 def C(d: dict) -> dict:
@@ -211,6 +219,63 @@ class TestUpdateDetection(unittest.TestCase):
         updates = asyncio.run(p._check_repo_updates("o/r"))
         self.assertNotIn("_stats", updates[0]["items"][0])
 
+    def test_issue_pr_first_check_sets_baseline(self):
+        p = make_plugin()
+        p._session = FakeSession({
+            "/issues": (200, [C(ISSUE2), C(ISSUE1)]),
+            "/pulls": (200, [C(PR2), C(PR1)]),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        self.assertEqual(updates, [])
+        self.assertEqual(p._state["repos"]["o/r"]["last_issue"], 2)
+        self.assertEqual(p._state["repos"]["o/r"]["last_pr"], 12)
+
+    def test_new_issue_and_pr_detected(self):
+        p = make_plugin()
+        p._state["repos"]["o/r"] = {
+            "last_commit": "", "last_release": "", "last_tag": "",
+            "last_issue": 1, "last_pr": 11,
+        }
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({
+            "/issues": (200, [C(ISSUE2), C(ISSUE1)]),
+            "/pulls": (200, [C(PR2), C(PR1)]),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        kinds = {u["type"] for u in updates}
+        self.assertEqual(kinds, {"issue", "pr"})
+        issue_group = next(u for u in updates if u["type"] == "issue")
+        self.assertEqual(len(issue_group["items"]), 1)
+        self.assertEqual(issue_group["items"][0]["number"], 2)
+        self.assertEqual(p._state["repos"]["o/r"]["last_issue"], 2)
+        self.assertEqual(p._state["repos"]["o/r"]["last_pr"], 12)
+
+    def test_issue_pr_disabled_skips(self):
+        p = make_plugin(notify_issue=False, notify_pr=False)
+        p._state["repos"]["o/r"] = {
+            "last_commit": "", "last_release": "", "last_tag": "",
+            "last_issue": 1, "last_pr": 11,
+        }
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({
+            "/issues": (200, [C(ISSUE2), C(ISSUE1)]),
+            "/pulls": (200, [C(PR2), C(PR1)]),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        self.assertEqual(updates, [])
+        # 禁用时不推进基线
+        self.assertEqual(p._state["repos"]["o/r"]["last_issue"], 1)
+
+    def test_issues_endpoint_excludes_pulls(self):
+        p = make_plugin()
+        # /issues 端点混入 PR（带 pull_request 字段）时应剔除
+        p._session = FakeSession({
+            "/issues": (200, [C(ISSUE1), {**C(PR1), "pull_request": {"url": "x"}}]),
+        })
+        issues = asyncio.run(p._get_issues("o/r", per_page=10))
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["number"], 1)
+
 
 class TestBuildMessage(unittest.TestCase):
     def test_build_commit_message(self):
@@ -234,6 +299,23 @@ class TestBuildMessage(unittest.TestCase):
         msg = p._build_update_message("o/r", [{"type": "tag", "items": [TAG]}])
         self.assertIn("新标签 #1", msg)
         self.assertIn("v1.1.0", msg)
+
+    def test_build_issue_message(self):
+        p = make_plugin()
+        msg = p._build_update_message("o/r", [{"type": "issue", "items": [{**C(ISSUE1), "_summary": "认证超时"}]}])
+        self.assertIn("新 Issue #1", msg)
+        self.assertIn("登录接口超时", msg)
+        self.assertIn("🤖 摘要: 认证超时", msg)
+        self.assertIn("https://github.com/o/r/issues/1", msg)
+
+    def test_build_pr_message(self):
+        p = make_plugin()
+        msg = p._build_update_message("o/r", [{"type": "pr", "items": [C(PR1)], }])
+        self.assertIn("新 PR #11", msg)
+        self.assertIn("修复登录问题", msg)
+        self.assertIn("待合并", msg)
+        msg2 = p._build_update_message("o/r", [{"type": "pr", "items": [C(PR2)]}])
+        self.assertIn("已合并", msg2)
 
     def test_long_message_truncated(self):
         p = make_plugin()
@@ -262,13 +344,32 @@ class TestFilterAndSummary(unittest.TestCase):
             {"type": "commit", "items": [C(COMMIT1), C(COMMIT2)]},  # fix bug / add feature
             {"type": "release", "items": [{**C(RELEASE), "body": "修复若干问题"}]},  # 不命中
             {"type": "tag", "items": [{**C(TAG), "name": "v1.2.0-feature"}]},  # 命中
+            {"type": "issue", "items": [{**C(ISSUE1), "title": "feature 请求"}]},  # 命中
+            {"type": "pr", "items": [C(PR1)]},  # 不命中
         ]
         filtered = p._filter_updates(updates)
-        self.assertEqual(len(filtered), 2)
+        self.assertEqual(len(filtered), 3)
         self.assertEqual(filtered[0]["type"], "commit")
         self.assertEqual(len(filtered[0]["items"]), 1)
         self.assertEqual(filtered[0]["items"][0]["commit"]["message"], "add feature")
         self.assertEqual(filtered[1]["type"], "tag")
+        self.assertEqual(filtered[2]["type"], "issue")
+
+    def test_issue_pr_summary_attached(self):
+        p = make_plugin(enable_ai_summary=True)
+        items = [C(ISSUE1), C(PR1)]
+        hints = []
+
+        async def fake_summarize(text, hint):
+            hints.append(hint)
+            return f"摘要：{hint}"
+
+        p._summarize = fake_summarize
+        asyncio.run(p._attach_summaries("issue", items[:1]))
+        asyncio.run(p._attach_summaries("pr", items[1:]))
+        self.assertEqual(items[0]["_summary"], "摘要：Issue")
+        self.assertEqual(items[1]["_summary"], "摘要：Pull Request")
+        self.assertEqual(hints, ["Issue", "Pull Request"])
 
     def test_check_respects_keyword_filter(self):
         p = make_plugin(keyword_filters="nonsense-keyword")

@@ -5,7 +5,7 @@ AstrBot 插件：监控 GitHub 仓库更新（提交 / Release / 标签），自
 ## 功能特性
 
 - **定时轮询**：默认每 5 分钟自动检查一次，发现更新立即推送（可配置，也可手动 `/gh check`）
-- **多类型更新**：支持检测新提交、新 Release、新标签
+- **多类型更新**：支持检测新提交、新 Release、新标签、新 Issue、新 PR
 - **富信息推送**：包含 SHA、提交信息、作者、时间、变更行数统计、链接等
 - **动态仓库管理**：`/gh add` / `/gh remove` 随时增删监控仓库，重启不丢失
 - **会话订阅**：`/gh 订阅` / `/gh 退订` 控制每个群/私聊是否接收推送；使用过指令的会话自动订阅
@@ -46,6 +46,8 @@ AstrBot 插件：监控 GitHub 仓库更新（提交 / Release / 标签），自
 | `max_events_per_check` | `5` | 每仓库每次最多通知的更新条数 |
 | `show_commit_stats` | `true` | 是否显示提交变更行数统计（会额外请求 API） |
 | `notify_release` | `true` | 是否通知新 Release |
+| `notify_issue` | `true` | 是否通知新 Issue |
+| `notify_pr` | `true` | 是否通知新 PR |
 | `notify_tag` | `true` | 是否通知新标签 |
 
 ## 数据存储
