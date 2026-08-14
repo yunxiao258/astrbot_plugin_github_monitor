@@ -2,6 +2,6 @@
 display_name: GitHub 仓库监控
 desc: 监控 GitHub 仓库更新（提交/发布/标签），自动推送到群聊与私聊
 help: 发送「/gh add owner/repo」添加监控仓库；「/gh list」查看监控列表；「/gh repos」查看个人仓库；「/gh 订阅」/「/gh 退订」控制本会话是否接收推送；「/gh check」立即检查更新；「/gh settoken <token>」设置 GitHub Token
-version: 1.2.0
+version: 1.2.1
 author: Administrator
 repo: https://github.com/yunxiao258/astrbot_plugin_github_monitor

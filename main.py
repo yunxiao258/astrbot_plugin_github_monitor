@@ -19,7 +19,7 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_github_monitor"
 PLUGIN_AUTHOR = "Administrator"
 PLUGIN_DESC = "监控 GitHub 仓库更新，自动推送到群聊与私聊"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.2.1"
 
 # GitHub API 基础地址与请求头
 GITHUB_API = "https://api.github.com"
@@ -28,6 +28,9 @@ TIMEZONE_BJ = timezone(timedelta(hours=8))  # 北京时间 UTC+8
 DEFAULT_TIMEOUT = 15  # HTTP 请求超时（秒）
 # AI 摘要并发限流：防止多仓库同时调用 LLM 打爆 provider
 _SUMMARY_SEM = asyncio.Semaphore(2)
+# API 拉取条数：固定较大值避免两轮检查间隔内更新超过 per_page 导致基线外更新丢失
+# （max_events_per_check 仅用于控制通知条数）
+_FETCH_PER_PAGE = 30
 # 仓库信息（星标数）缓存 TTL（秒）
 _REPO_INFO_TTL = 600
 
@@ -112,6 +115,11 @@ class GitHubMonitorPlugin(Star):
             default_state["subscribers"] = []
         if not isinstance(default_state.get("repos"), dict):
             default_state["repos"] = {}
+        # 仓库值为 dict 的类型防御：非法条目直接丢弃，避免检查阶段 AttributeError
+        default_state["repos"] = {
+            k: v for k, v in default_state["repos"].items()
+            if isinstance(v, dict)
+        }
         if not isinstance(default_state.get("token"), str):
             default_state["token"] = ""
         return default_state
@@ -181,6 +189,14 @@ class GitHubMonitorPlugin(Star):
         return subs
 
     # ========== GitHub API 封装 ==========
+
+    @staticmethod
+    def _safe_int(key_value, default: int) -> int:
+        """安全整数转换：非法值回退默认，避免 WebUI 脏值导致监控任务崩溃"""
+        try:
+            return int(key_value)
+        except (TypeError, ValueError):
+            return int(default)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取（或创建）复用的 aiohttp 会话"""
@@ -274,20 +290,20 @@ class GitHubMonitorPlugin(Star):
         return status, data if isinstance(data, list) else []
 
     async def _get_repo_stars(self, repo: str) -> int:
-        """获取仓库星标数（带 TTL 缓存，失败返回 0）"""
+        """获取仓库星标数（带 TTL 缓存，失败返回 0 且不缓存，避免限流盲区）"""
         now = time.monotonic()
         cached = self._repo_info_cache.get(repo)
         if cached and now - cached[1] < _REPO_INFO_TTL:
             return cached[0]
         status, data = await self._gh_request(f"/repos/{repo}")
-        stars = 0
         if status == 200 and isinstance(data, dict):
             try:
                 stars = int(data.get("stargazers_count") or 0)
             except (TypeError, ValueError):
                 stars = 0
-        self._repo_info_cache[repo] = (stars, now)
-        return stars
+            self._repo_info_cache[repo] = (stars, now)
+            return stars
+        return 0
 
     def _keywords(self) -> list[str]:
         """解析关键词过滤配置（逗号/顿号分隔，去空）"""
@@ -334,15 +350,22 @@ class GitHubMonitorPlugin(Star):
             if provider is None:
                 return None
             async with _SUMMARY_SEM:
-                resp = await provider.text_chat(
-                    prompt=(
-                        f"请用简体中文为下面的 GitHub {context_hint} 写一句不超过 80 字的摘要"
-                        f"（只输出摘要本身，不要任何前缀）。内容如下：\n{text[:2000]}"
+                # 加超时：LLM 卡住时避免长期占用信号量阻塞其他仓库
+                resp = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=(
+                            f"请用简体中文为下面的 GitHub {context_hint} 写一句不超过 80 字的摘要"
+                            f"（只输出摘要本身，不要任何前缀）。内容如下：\n{text[:2000]}"
+                        ),
+                        system_prompt="你是一个 Git 更新摘要助手，输出简洁客观。",
                     ),
-                    system_prompt="你是一个 Git 更新摘要助手，输出简洁客观。",
+                    timeout=30,
                 )
                 summary = (getattr(resp, "completion_text", "") or "").strip()
             return summary[:200] or None
+        except asyncio.TimeoutError:
+            logger.warning("AI 摘要生成超时")
+            return None
         except Exception as e:
             logger.warning(f"AI 摘要生成失败: {e}")
             return None
@@ -378,19 +401,20 @@ class GitHubMonitorPlugin(Star):
 
     async def _check_repo_updates_locked(self, repo: str, save: bool = True) -> list[dict]:
         """持锁状态下的检查实现（勿直接调用）"""
-        repo_state = self._state.setdefault(
-            "repos", {}
-        ).setdefault(repo, {"last_commit": "", "last_release": "", "last_tag": ""})
+        # 仓库状态不存在则创建（/_gh add 之外的首次检查）；删除操作与检查互斥由 _check_lock 保证
+        repo_state = self._state.setdefault("repos", {}).setdefault(
+            repo, {"last_commit": "", "last_release": "", "last_tag": ""}
+        )
         initialized = self._state.setdefault("initialized", set())
-        max_events = max(1, int(self.config.get("max_events_per_check", 5) or 5))
+        max_events = max(1, self._safe_int(self.config.get("max_events_per_check", 5), 5))
         # 星标数下限过滤：低于阈值直接跳过（基线不推进，后续涨星后仍会正常推送）
-        min_stars = int(self.config.get("min_stars", 0) or 0)
+        min_stars = self._safe_int(self.config.get("min_stars", 0), 0)
         if min_stars > 0 and await self._get_repo_stars(repo) < min_stars:
             return []
         updates: list[dict] = []
 
         # 1. 新提交
-        commits = await self._get_commits(repo, per_page=max_events)
+        commits = await self._get_commits(repo, per_page=_FETCH_PER_PAGE)
         if commits:
             latest_sha = commits[0].get("sha", "")
             new_commits = []
@@ -404,6 +428,7 @@ class GitHubMonitorPlugin(Star):
                 repo_state["last_commit"] = latest_sha
                 # 翻转：API 返回最新在前
                 new_commits.reverse()
+                new_commits = new_commits[:max_events]  # 通知条数上限
                 if new_commits:
                     # 预取变更统计（异步），供消息构建使用
                     if self.config.get("show_commit_stats", True):
@@ -422,7 +447,7 @@ class GitHubMonitorPlugin(Star):
 
         # 2. 新 release
         if self.config.get("notify_release", True):
-            releases = await self._get_releases(repo, per_page=max_events)
+            releases = await self._get_releases(repo, per_page=_FETCH_PER_PAGE)
             if releases:
                 last_release = repo_state.get("last_release", "")
                 if last_release:
@@ -433,6 +458,7 @@ class GitHubMonitorPlugin(Star):
                             break
                         new_releases.append(r)
                     new_releases.reverse()
+                    new_releases = new_releases[:max_events]  # 通知条数上限
                     if new_releases:
                         repo_state["last_release"] = releases[0].get("tag_name", "")
                         await self._attach_summaries("release", new_releases)
@@ -442,7 +468,7 @@ class GitHubMonitorPlugin(Star):
 
         # 3. 新 tag
         if self.config.get("notify_tag", True):
-            tags = await self._get_tags(repo, per_page=max_events)
+            tags = await self._get_tags(repo, per_page=_FETCH_PER_PAGE)
             if tags:
                 last_tag = repo_state.get("last_tag", "")
                 if last_tag:
@@ -453,6 +479,7 @@ class GitHubMonitorPlugin(Star):
                             break
                         new_tags.append(t)
                     new_tags.reverse()
+                    new_tags = new_tags[:max_events]  # 通知条数上限
                     if new_tags:
                         repo_state["last_tag"] = tags[0].get("name", "")
                         updates.append({"type": "tag", "items": new_tags})
@@ -587,11 +614,17 @@ class GitHubMonitorPlugin(Star):
             return
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        # 记录未捕获异常，避免任务静默死亡
+        self._monitor_task.add_done_callback(
+            lambda t: (
+                logger.error(f"监控任务异常退出: {t.exception()}") if not t.cancelled() and t.exception() else None
+            )
+        )
         logger.info("【github_monitor】后台监控任务已启动")
 
     async def _monitor_loop(self):
-        """后台轮询循环"""
-        interval = max(1, int(self.config.get("check_interval_minutes", 5) or 5)) * 60
+        """后台轮询循环（配置非法时回退默认间隔，任务不会死亡）"""
+        interval = max(1, self._safe_int(self.config.get("check_interval_minutes", 5), 5)) * 60
         while self._running:
             try:
                 await self._broadcast_updates()
@@ -695,12 +728,14 @@ class GitHubMonitorPlugin(Star):
         repo = self._parse_repo(args[0])
         if not repo:
             return self._send_text(event, "❌ 仓库格式不正确")
-        repos = self._state.setdefault("repos", {})
-        if repo not in repos:
-            return self._send_text(event, f"ℹ️ 仓库 {repo} 不在监控列表中")
-        repos.pop(repo, None)
-        self._state.get("initialized", set()).discard(repo)
-        self._save_state()
+        # 持锁删除：防止与定时/手动检查并发时仓库被检查逻辑"复活"
+        async with self._check_lock:
+            repos = self._state.setdefault("repos", {})
+            if repo not in repos:
+                return self._send_text(event, f"ℹ️ 仓库 {repo} 不在监控列表中")
+            repos.pop(repo, None)
+            self._state.get("initialized", set()).discard(repo)
+            self._save_state()
         return self._send_text(event, f"🗑️ 已移除监控仓库: {repo}")
 
     async def _cmd_list(self, event: AstrMessageEvent, args: list[str]) -> MessageEventResult | None:
@@ -742,7 +777,12 @@ class GitHubMonitorPlugin(Star):
         return self._send_text(event, "\n".join(lines))
 
     async def _cmd_check(self, event: AstrMessageEvent, args: list[str]) -> MessageEventResult | None:
-        repo = self._parse_repo(args[0]) if args else None
+        if args:
+            repo = self._parse_repo(args[0])
+            if not repo:
+                return self._send_text(event, "❌ 仓库格式不正确，应为 owner/repo，例如: /gh check yunxiao258/astrbot_plugin_context_analyzer")
+        else:
+            repo = None
         result = await self._manual_check(repo)
         return self._send_text(event, result)
 

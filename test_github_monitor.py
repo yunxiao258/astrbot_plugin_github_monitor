@@ -13,6 +13,16 @@ sys.path.insert(0, r"D:\astrbot\data\plugins")
 from main import GitHubMonitorPlugin, TIMEZONE_BJ  # noqa: E402
 
 
+class FakeEvent:
+    """模拟 AstrMessageEvent（仅支持 chain_result 与 message 属性）"""
+
+    def __init__(self, text=""):
+        self.message = {"text": text}
+
+    def chain_result(self, chain):
+        return chain
+
+
 def make_plugin(**overrides):
     cfg = {
         "default_repos": "",
@@ -393,8 +403,77 @@ class TestConcurrentBroadcast(unittest.TestCase):
         p._send_to_subscribers = fake_send
         p._save_state = lambda: None
         asyncio.run(p._broadcast_updates())
-        # 单仓库异常不影响其他仓库推送
+        # 单仓异常不影响其他仓库推送
         self.assertEqual(len(sent), 1)
+
+
+class TestFixes(unittest.TestCase):
+    def test_safe_int_falls_back_on_dirty_config(self):
+        p = make_plugin(check_interval_minutes="abc", max_events_per_check=None, min_stars="")
+        self.assertEqual(p._safe_int(p.config.get("check_interval_minutes", 5), 5), 5)
+        self.assertEqual(p._safe_int(p.config.get("max_events_per_check", 5), 5), 5)
+        self.assertEqual(p._safe_int(p.config.get("min_stars", 0), 0), 0)
+        p2 = make_plugin(check_interval_minutes=7)
+        self.assertEqual(p2._safe_int(p2.config.get("check_interval_minutes", 5), 5), 7)
+
+    def test_fetch_per_page_beyond_max_events(self):
+        # 提交数量超过 max_events_per_check=2 时仍能全部检测（per_page=30），通知截断为 2 条
+        p = make_plugin(max_events_per_check=2)
+        commits = [
+            {"sha": f"sha{i:02d}", "html_url": f"https://github.com/o/r/commit/sha{i:02d}",
+             "commit": {"message": f"c{i}", "author": {"name": "A", "date": "2026-08-02T00:00:00Z"}}}
+            for i in range(5, 0, -1)  # sha05 ... sha01（最新在前）
+        ]
+        p._state["repos"]["o/r"] = {"last_commit": "sha01", "last_release": "", "last_tag": ""}
+        p._state["initialized"].add("o/r")
+        p.config["show_commit_stats"] = False
+        p._session = FakeSession({
+            "/commits": (200, commits),
+            "/releases": (200, []),
+            "/tags": (200, []),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(len(updates[0]["items"]), 2)  # 通知条数上限 2
+        # 但基线已推进到最新（sha05 之后全部检测到，不丢失）
+        self.assertEqual(p._state["repos"]["o/r"]["last_commit"], "sha05")
+
+    def test_remove_under_lock_does_not_resurrect(self):
+        p = make_plugin()
+        p._state["repos"]["o/r"] = {"last_commit": "abc", "last_release": "", "last_tag": ""}
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({})
+        # 先 remove（持锁），再并发检查已删仓库 → 检查会重建吗？remove 持锁后检查列表不含它
+        async def scenario():
+            await p._cmd_remove(FakeEvent(), ["o/r"])
+            return "o/r" in p._state["repos"]
+
+        self.assertFalse(asyncio.run(scenario()))
+
+    def test_stars_failure_not_cached(self):
+        p = make_plugin()
+        p._session = FakeSession({})  # 请求全部失败
+        # 第一次失败返回 0 且不缓存
+        self.assertEqual(asyncio.run(p._get_repo_stars("o/r")), 0)
+        self.assertNotIn("o/r", p._repo_info_cache)
+
+    def test_check_bad_repo_returns_format_error(self):
+        p = make_plugin()
+        p._session = FakeSession({})
+        result = asyncio.run(p._cmd_check(FakeEvent(), ["not-a-repo"]))
+        self.assertIn("格式不正确", result[0].text)
+
+    def test_state_load_drops_bad_repo_entries(self):
+        p = make_plugin()
+        tmp = tempfile.mkdtemp(prefix="gh_state_test_")
+        state_file = os.path.join(tmp, "state.json")
+        with open(state_file, "w", encoding="utf-8") as f:
+            import json
+            json.dump({"repos": {"good": {"last_commit": "x"}, "bad": "not-a-dict"}}, f)
+        p._state_file = state_file
+        p._state = p._load_state()
+        self.assertIn("good", p._state["repos"])
+        self.assertNotIn("bad", p._state["repos"])
 
 
 if __name__ == "__main__":
