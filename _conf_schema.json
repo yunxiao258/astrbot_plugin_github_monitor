@@ -48,5 +48,20 @@
     "description": "是否通知新标签（tag）",
     "type": "bool",
     "default": true
+  },
+  "keyword_filters": {
+    "description": "关键词过滤：提交信息/发布说明命中任一关键词才推送，多个用英文逗号或顿号分隔；留空不过滤",
+    "type": "string",
+    "default": ""
+  },
+  "min_stars": {
+    "description": "星标数下限：仓库 Star 数低于此值不推送更新（0 为不限）",
+    "type": "int",
+    "default": 0
+  },
+  "enable_ai_summary": {
+    "description": "是否启用 AI 摘要：用默认 LLM Provider 为新提交/新发布生成一句话摘要",
+    "type": "bool",
+    "default": false
   }
 }

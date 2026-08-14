@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -18,13 +19,17 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_github_monitor"
 PLUGIN_AUTHOR = "Administrator"
 PLUGIN_DESC = "监控 GitHub 仓库更新，自动推送到群聊与私聊"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
 # GitHub API 基础地址与请求头
 GITHUB_API = "https://api.github.com"
 GITHUB_USER_AGENT = "astrbot-plugin-github-monitor"
 TIMEZONE_BJ = timezone(timedelta(hours=8))  # 北京时间 UTC+8
 DEFAULT_TIMEOUT = 15  # HTTP 请求超时（秒）
+# AI 摘要并发限流：防止多仓库同时调用 LLM 打爆 provider
+_SUMMARY_SEM = asyncio.Semaphore(2)
+# 仓库信息（星标数）缓存 TTL（秒）
+_REPO_INFO_TTL = 600
 
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION)
@@ -56,6 +61,8 @@ class GitHubMonitorPlugin(Star):
         self._running = False
         # 检查互斥锁：防止定时轮询与手动 /gh check 并发检查导致重复推送
         self._check_lock = asyncio.Lock()
+        # 仓库信息缓存（星标数）：{repo: (stargazers_count, 获取时间戳)}
+        self._repo_info_cache: dict[str, tuple[int, float]] = {}
 
         logger.info(f"【{PLUGIN_NAME}】插件初始化完成")
 
@@ -266,6 +273,102 @@ class GitHubMonitorPlugin(Star):
             )
         return status, data if isinstance(data, list) else []
 
+    async def _get_repo_stars(self, repo: str) -> int:
+        """获取仓库星标数（带 TTL 缓存，失败返回 0）"""
+        now = time.monotonic()
+        cached = self._repo_info_cache.get(repo)
+        if cached and now - cached[1] < _REPO_INFO_TTL:
+            return cached[0]
+        status, data = await self._gh_request(f"/repos/{repo}")
+        stars = 0
+        if status == 200 and isinstance(data, dict):
+            try:
+                stars = int(data.get("stargazers_count") or 0)
+            except (TypeError, ValueError):
+                stars = 0
+        self._repo_info_cache[repo] = (stars, now)
+        return stars
+
+    def _keywords(self) -> list[str]:
+        """解析关键词过滤配置（逗号/顿号分隔，去空）"""
+        raw = str(self.config.get("keyword_filters", "") or "").strip()
+        return [k.strip().lower() for k in re.split(r"[,，、]", raw) if k.strip()]
+
+    @staticmethod
+    def _matches_keywords(text: str, keywords: list[str]) -> bool:
+        """判断文本是否命中任一关键词（大小写不敏感）"""
+        if not keywords:
+            return True
+        t = (text or "").lower()
+        return any(k in t for k in keywords)
+
+    def _filter_updates(self, updates: list[dict]) -> list[dict]:
+        """按关键词过滤更新条目（返回过滤后的列表）"""
+        keywords = self._keywords()
+        if not keywords:
+            return updates
+        filtered = []
+        for group in updates:
+            kind = group["type"]
+            kept = []
+            for item in group["items"]:
+                if kind == "commit":
+                    text = (item.get("commit") or {}).get("message", "")
+                elif kind == "release":
+                    r = item
+                    text = f"{r.get('name') or ''} {r.get('tag_name') or ''} {r.get('body') or ''}"
+                else:  # tag
+                    text = item.get("name", "")
+                if self._matches_keywords(text, keywords):
+                    kept.append(item)
+            if kept:
+                filtered.append({"type": kind, "items": kept})
+        return filtered
+
+    async def _summarize(self, text: str, context_hint: str) -> str | None:
+        """用 LLM 生成更新摘要，失败或无 provider 时返回 None"""
+        if not self.config.get("enable_ai_summary", False):
+            return None
+        try:
+            provider = self.context.get_using_provider(None)
+            if provider is None:
+                return None
+            async with _SUMMARY_SEM:
+                resp = await provider.text_chat(
+                    prompt=(
+                        f"请用简体中文为下面的 GitHub {context_hint} 写一句不超过 80 字的摘要"
+                        f"（只输出摘要本身，不要任何前缀）。内容如下：\n{text[:2000]}"
+                    ),
+                    system_prompt="你是一个 Git 更新摘要助手，输出简洁客观。",
+                )
+                summary = (getattr(resp, "completion_text", "") or "").strip()
+            return summary[:200] or None
+        except Exception as e:
+            logger.warning(f"AI 摘要生成失败: {e}")
+            return None
+
+    async def _attach_summaries(self, kind: str, items: list[dict]):
+        """为更新条目生成摘要并挂到 _summary 字段（逐个失败降级）"""
+        if not self.config.get("enable_ai_summary", False):
+            return
+        for item in items:
+            if kind == "commit":
+                commit = item.get("commit", {})
+                text = (commit.get("message") or "").strip()
+            else:  # release
+                text = f"{item.get('name') or ''}\n{item.get('body') or ''}".strip()
+            if text:
+                try:
+                    summary = await self._summarize(
+                        text, "提交" if kind == "commit" else "版本发布"
+                    )
+                except Exception:  # noqa: BLE001
+                    summary = None
+                if summary:
+                    item["_summary"] = summary
+                else:
+                    item.pop("_summary", None)
+
     # ========== 更新检测与去重 ==========
 
     async def _check_repo_updates(self, repo: str) -> list[dict]:
@@ -280,6 +383,10 @@ class GitHubMonitorPlugin(Star):
         ).setdefault(repo, {"last_commit": "", "last_release": "", "last_tag": ""})
         initialized = self._state.setdefault("initialized", set())
         max_events = max(1, int(self.config.get("max_events_per_check", 5) or 5))
+        # 星标数下限过滤：低于阈值直接跳过（基线不推进，后续涨星后仍会正常推送）
+        min_stars = int(self.config.get("min_stars", 0) or 0)
+        if min_stars > 0 and await self._get_repo_stars(repo) < min_stars:
+            return []
         updates: list[dict] = []
 
         # 1. 新提交
@@ -308,6 +415,7 @@ class GitHubMonitorPlugin(Star):
                                     c["_stats"] = (add, dele)
                                 except Exception:
                                     c["_stats"] = None
+                    await self._attach_summaries("commit", new_commits)
                     updates.append({"type": "commit", "items": new_commits})
             else:
                 repo_state["last_commit"] = latest_sha
@@ -327,6 +435,7 @@ class GitHubMonitorPlugin(Star):
                     new_releases.reverse()
                     if new_releases:
                         repo_state["last_release"] = releases[0].get("tag_name", "")
+                        await self._attach_summaries("release", new_releases)
                         updates.append({"type": "release", "items": new_releases})
                 else:
                     repo_state["last_release"] = releases[0].get("tag_name", "")
@@ -350,7 +459,8 @@ class GitHubMonitorPlugin(Star):
                 else:
                     repo_state["last_tag"] = tags[0].get("name", "")
 
-        # 标记已初始化基线
+        # 关键词过滤 + 标记已初始化基线
+        updates = self._filter_updates(updates)
         if repo not in initialized:
             initialized.add(repo)
 
@@ -379,6 +489,9 @@ class GitHubMonitorPlugin(Star):
                     lines.append(f"🆕 新提交 #{idx}")
                     lines.append(f"🔖 SHA: {sha_short}")
                     lines.append(f"💬 信息: {message}")
+                    # AI 摘要（检查阶段已生成到 _summary）
+                    if c.get("_summary"):
+                        lines.append(f"🤖 摘要: {c['_summary']}")
                     lines.append(f"👤 作者: {author}" + (f" <{author_email}>" if author_email else ""))
                     lines.append(f"🕐 时间: {date_str}")
                     # 变更统计在检查阶段已预取到 _stats 字段
@@ -400,7 +513,9 @@ class GitHubMonitorPlugin(Star):
                     lines.append(f"📝 名称: {name}")
                     lines.append(f"🕐 发布时间: {published}")
                     lines.append(f"👤 发布者: {author}")
-                    if body:
+                    if r.get("_summary"):
+                        lines.append(f"🤖 摘要: {r['_summary']}")
+                    elif body:
                         body_short = body[:200] + ("…" if len(body) > 200 else "")
                         lines.append(f"📄 说明: {body_short}")
                     lines.append(f"🔗 {r.get('html_url') or f'https://github.com/{repo}/releases/tag/{tag}'}")
@@ -686,7 +801,8 @@ class GitHubMonitorPlugin(Star):
             "/gh 订阅 / 退订      订阅或退订本会话推送\n"
             "/gh help             查看帮助\n"
             "\n"
-            "💡 定时自动检查默认每 5 分钟一次；使用过指令的会话会自动订阅推送。"
+            "💡 定时自动检查默认每 5 分钟一次；使用过指令的会话会自动订阅推送。\n"
+            "💡 过滤配置：keyword_filters 命中关键词才推送，min_stars 按星标数过滤，enable_ai_summary 启用 AI 摘要。"
         )
         return self._send_text(event, help_text)
 

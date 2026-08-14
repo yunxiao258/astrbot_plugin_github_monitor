@@ -230,6 +230,122 @@ class TestBuildMessage(unittest.TestCase):
         self.assertIn("已折叠显示", msg)
 
 
+class TestFilterAndSummary(unittest.TestCase):
+    def test_keywords_parsing(self):
+        p = make_plugin(keyword_filters="修复, v1.2，优化")
+        self.assertEqual(p._keywords(), ["修复", "v1.2", "优化"])
+
+    def test_keywords_empty_means_no_filter(self):
+        p = make_plugin()
+        self.assertEqual(p._keywords(), [])
+
+    def test_matches_keywords_case_insensitive(self):
+        self.assertTrue(GitHubMonitorPlugin._matches_keywords("Fix bug", ["fix"]))
+        self.assertFalse(GitHubMonitorPlugin._matches_keywords("Fix bug", ["release"]))
+        self.assertTrue(GitHubMonitorPlugin._matches_keywords("anything", []))
+
+    def test_filter_updates_by_type(self):
+        p = make_plugin(keyword_filters="feature")
+        updates = [
+            {"type": "commit", "items": [C(COMMIT1), C(COMMIT2)]},  # fix bug / add feature
+            {"type": "release", "items": [{**C(RELEASE), "body": "修复若干问题"}]},  # 不命中
+            {"type": "tag", "items": [{**C(TAG), "name": "v1.2.0-feature"}]},  # 命中
+        ]
+        filtered = p._filter_updates(updates)
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(filtered[0]["type"], "commit")
+        self.assertEqual(len(filtered[0]["items"]), 1)
+        self.assertEqual(filtered[0]["items"][0]["commit"]["message"], "add feature")
+        self.assertEqual(filtered[1]["type"], "tag")
+
+    def test_check_respects_keyword_filter(self):
+        p = make_plugin(keyword_filters="nonsense-keyword")
+        p._state["repos"]["o/r"] = {"last_commit": "abc123", "last_release": "v1.0.0", "last_tag": "v1.0.0"}
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({
+            "/commits": (200, [C(COMMIT2), C(COMMIT1)]),
+            "/releases": (200, [C(RELEASE)]),
+            "/tags": (200, [C(TAG)]),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        self.assertEqual(updates, [])
+        # 基线仍推进：被过滤的更新不会重复推送
+        self.assertEqual(p._state["repos"]["o/r"]["last_commit"], "def456")
+
+    def test_min_stars_filters_repo(self):
+        p = make_plugin(min_stars=100)
+        p._state["repos"]["o/r"] = {"last_commit": "abc123", "last_release": "", "last_tag": ""}
+        p._state["initialized"].add("o/r")
+        session = FakeSession({
+            "/repos/o/r": (200, {"stargazers_count": 42}),
+            "/commits": (200, [C(COMMIT2), C(COMMIT1)]),
+        })
+        p._session = session
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        self.assertEqual(updates, [])
+        # 星标不足时基线不推进（涨星后仍会推送）
+        self.assertEqual(p._state["repos"]["o/r"]["last_commit"], "abc123")
+
+    def test_repo_stars_cached(self):
+        p = make_plugin(min_stars=0)
+        calls = {"n": 0}
+
+        class CountingSession(FakeSession):
+            def get(self, url, params=None, headers=None):
+                if url.endswith("/repos/o/r"):
+                    calls["n"] += 1
+                    return FakeResponse(200, {"stargazers_count": 123})
+                return FakeResponse(404, None)
+
+        p._session = CountingSession({})
+        stars = asyncio.run(p._get_repo_stars("o/r"))
+        self.assertEqual(stars, 123)
+        stars = asyncio.run(p._get_repo_stars("o/r"))
+        self.assertEqual(stars, 123)
+        self.assertEqual(calls["n"], 1, "第二次应命中 TTL 缓存")
+
+    def test_ai_summary_attached_when_enabled(self):
+        p = make_plugin(enable_ai_summary=True)
+        items = [C(COMMIT2)]
+
+        async def fake_summarize(text, hint):
+            return f"摘要：{hint}"
+
+        p._summarize = fake_summarize
+        asyncio.run(p._attach_summaries("commit", items))
+        self.assertEqual(items[0]["_summary"], "摘要：提交")
+
+    def test_ai_summary_skipped_when_disabled(self):
+        p = make_plugin(enable_ai_summary=False)
+        items = [C(COMMIT2)]
+        asyncio.run(p._attach_summaries("commit", items))
+        self.assertNotIn("_summary", items[0])
+
+    def test_summary_failure_degrades(self):
+        p = make_plugin(enable_ai_summary=True)
+        items = [C(RELEASE)]
+
+        async def fail(text, hint):
+            raise RuntimeError("provider down")
+
+        p._summarize = fail
+        asyncio.run(p._attach_summaries("release", items))
+        self.assertNotIn("_summary", items[0])
+
+    def test_build_message_shows_summary(self):
+        p = make_plugin()
+        msg = p._build_update_message(
+            "o/r",
+            [{"type": "commit", "items": [{**C(COMMIT2), "_summary": "修复了登录问题"}]}],
+        )
+        self.assertIn("🤖 摘要: 修复了登录问题", msg)
+        msg2 = p._build_update_message(
+            "o/r",
+            [{"type": "release", "items": [{**C(RELEASE), "_summary": "本次更新优化了性能"}]}],
+        )
+        self.assertIn("🤖 摘要: 本次更新优化了性能", msg2)
+
+
 class TestConcurrentBroadcast(unittest.TestCase):
     def test_broadcast_runs_concurrently(self):
         p = make_plugin()
