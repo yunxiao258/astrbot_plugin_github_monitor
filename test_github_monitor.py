@@ -14,10 +14,12 @@ from main import GitHubMonitorPlugin, TIMEZONE_BJ  # noqa: E402
 
 
 class FakeEvent:
-    """模拟 AstrMessageEvent（仅支持 chain_result 与 message 属性）"""
+    """模拟 AstrMessageEvent（支持 chain_result 与 message 属性）"""
 
-    def __init__(self, text=""):
+    def __init__(self, text="", origin="onebot:123:gid:10001"):
         self.message = {"text": text}
+        self.message_str = text
+        self.unified_msg_origin = origin
 
     def chain_result(self, chain):
         return chain
@@ -474,6 +476,79 @@ class TestFixes(unittest.TestCase):
         p._state = p._load_state()
         self.assertIn("good", p._state["repos"])
         self.assertNotIn("bad", p._state["repos"])
+
+
+class TestCommands(unittest.TestCase):
+    """命令分发层：隐式订阅、订阅/退订、settoken 验证与还原"""
+
+    def test_ensure_subscribed_on_command(self):
+        p = make_plugin()
+        ev = FakeEvent("/gh list", origin="onebot:g:10001")
+        p._session = FakeSession({})
+        asyncio.run(p.gh_command(ev))
+        self.assertIn("onebot:g:10001", p._state["subscribers"])
+
+    def test_sub_and_unsub(self):
+        p = make_plugin()
+        ev = FakeEvent("/gh 订阅", origin="onebot:g:10001")
+        p._session = FakeSession({})
+        asyncio.run(p._cmd_sub(ev, []))
+        self.assertIn("onebot:g:10001", p._state["subscribers"])
+        # 重复订阅不重复添加
+        asyncio.run(p._cmd_sub(ev, []))
+        self.assertEqual(p._state["subscribers"].count("onebot:g:10001"), 1)
+        asyncio.run(p._cmd_unsub(ev, []))
+        self.assertNotIn("onebot:g:10001", p._state["subscribers"])
+
+    def test_unknown_subcommand(self):
+        p = make_plugin()
+        ev = FakeEvent("/gh 不存在", origin="onebot:g:10001")
+        result = asyncio.run(p.gh_command(ev))
+        self.assertIn("未知子指令", result[0].text)
+
+    def test_settoken_short_token_rejected(self):
+        p = make_plugin()
+        p._session = FakeSession({})
+        ev = FakeEvent()
+        result = asyncio.run(p._cmd_settoken(ev, ["short"]))
+        self.assertIn("格式不正确", result[0].text)
+        self.assertEqual(p._state["token"], "")
+
+    def test_settoken_invalid_restores_old(self):
+        p = make_plugin()
+        p._state["token"] = "old_token"
+        p._session = FakeSession({"/user": (401, {"message": "Bad credentials"})})
+        ev = FakeEvent()
+        result = asyncio.run(p._cmd_settoken(ev, ["ghp_" + "x" * 30]))
+        self.assertIn("无效", result[0].text)
+        self.assertEqual(p._state["token"], "old_token")
+
+    def test_settoken_valid_saves_encrypted(self):
+        p = make_plugin()
+        p._session = FakeSession({"/user": (200, {"login": "yunxiao258"})})
+        ev = FakeEvent()
+        import secret
+        original = secret.secure_store
+
+        def fake_store(token):
+            return f"enc:{token}"
+
+        try:
+            secret.secure_store = fake_store
+            result = asyncio.run(p._cmd_settoken(ev, ["ghp_" + "y" * 30]))
+        finally:
+            secret.secure_store = original
+        self.assertIn("已验证有效", result[0].text)
+        self.assertEqual(p._state["token"], "enc:ghp_" + "y" * 30)
+
+    def test_settoken_network_error_restores_old(self):
+        p = make_plugin()
+        p._state["token"] = "old_token"
+        p._session = FakeSession({})  # 404 → 视为网络/异常
+        ev = FakeEvent()
+        result = asyncio.run(p._cmd_settoken(ev, ["ghp_" + "z" * 30]))
+        self.assertIn("无法验证", result[0].text)
+        self.assertEqual(p._state["token"], "old_token")
 
 
 if __name__ == "__main__":

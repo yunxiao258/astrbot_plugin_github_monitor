@@ -797,7 +797,10 @@ class GitHubMonitorPlugin(Star):
         self._state["token"] = token
         status, _ = await self._gh_request("/user")
         if status == 200:
-            from .secret import secure_store
+            try:
+                from .secret import secure_store
+            except ImportError:
+                from secret import secure_store  # 测试/独立运行环境
 
             self._state["token"] = secure_store(token)
             self._save_state()
