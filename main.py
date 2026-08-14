@@ -18,7 +18,7 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_github_monitor"
 PLUGIN_AUTHOR = "Administrator"
 PLUGIN_DESC = "监控 GitHub 仓库更新，自动推送到群聊与私聊"
-PLUGIN_VERSION = "1.0.1"
+PLUGIN_VERSION = "1.1.0"
 
 # GitHub API 基础地址与请求头
 GITHUB_API = "https://api.github.com"
@@ -271,9 +271,9 @@ class GitHubMonitorPlugin(Star):
     async def _check_repo_updates(self, repo: str) -> list[dict]:
         """检查单个仓库的更新，返回需要通知的更新列表；首次添加只设基线不通知"""
         async with self._check_lock:  # 互斥：防止定时与手动并发重复推送
-            return await self._check_repo_updates_locked(repo)
+            return await self._check_repo_updates_locked(repo, save=True)
 
-    async def _check_repo_updates_locked(self, repo: str) -> list[dict]:
+    async def _check_repo_updates_locked(self, repo: str, save: bool = True) -> list[dict]:
         """持锁状态下的检查实现（勿直接调用）"""
         repo_state = self._state.setdefault(
             "repos", {}
@@ -354,7 +354,8 @@ class GitHubMonitorPlugin(Star):
         if repo not in initialized:
             initialized.add(repo)
 
-        self._save_state()
+        if save:
+            self._save_state()
         return updates
 
     # ========== 消息构建与推送 ==========
@@ -437,15 +438,23 @@ class GitHubMonitorPlugin(Star):
                 logger.warning(f"向会话 {session} 推送失败: {e}")
 
     async def _broadcast_updates(self):
-        """检查所有仓库并将更新推送到订阅会话"""
+        """并发检查所有仓库并将更新推送到订阅会话"""
         repos = list(self._state.get("repos", {}).keys())
         if not repos:
             return
-        for repo in repos:
+        # 持锁并发检查：与手动检查互斥，同时避免仓库多时串行拉取过慢
+        async with self._check_lock:
+            results = await asyncio.gather(
+                *(self._check_repo_updates_locked(r, save=False) for r in repos),
+                return_exceptions=True,
+            )
+            self._save_state()
+        for repo, result in zip(repos, results):
             try:
-                updates = await self._check_repo_updates(repo)
-                if updates:
-                    msg = self._build_update_message(repo, updates)
+                if isinstance(result, Exception):
+                    raise result
+                if result:
+                    msg = self._build_update_message(repo, result)
                     await self._send_to_subscribers(msg)
                     await asyncio.sleep(0.5)  # 避免连续推送过快
             except Exception as e:
