@@ -1,4 +1,4 @@
-"""AstrBot GitHub 仓库监控插件：监控仓库更新（提交/发布/标签），自动推送到群聊与私聊"""
+﻿"""AstrBot GitHub 仓库监控插件：监控仓库更新（提交/发布/标签），自动推送到群聊与私聊"""
 
 import asyncio
 import json
@@ -18,7 +18,7 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_github_monitor"
 PLUGIN_AUTHOR = "Administrator"
 PLUGIN_DESC = "监控 GitHub 仓库更新，自动推送到群聊与私聊"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.0.1"
 
 # GitHub API 基础地址与请求头
 GITHUB_API = "https://api.github.com"
@@ -148,8 +148,16 @@ class GitHubMonitorPlugin(Star):
             return str(iso_str)
 
     def _get_token(self) -> str:
-        """获取 Token：优先 /gh settoken 写入的状态，其次配置项"""
-        return (self._state.get("token") or "").strip() or str(
+        """获取 Token：优先 /gh settoken 写入的状态（DPAPI 加密存储），其次配置项"""
+        stored = self._state.get("token") or ""
+        if stored.startswith("dpapi:"):
+            try:
+                from .secret import dpapi_decrypt
+
+                stored = dpapi_decrypt(stored[6:])
+            except Exception:  # noqa: BLE001
+                stored = ""
+        return stored.strip() or str(
             self.config.get("github_token", "") or ""
         ).strip()
 
@@ -616,23 +624,29 @@ class GitHubMonitorPlugin(Star):
 
     async def _cmd_settoken(self, event: AstrMessageEvent, args: list[str]) -> MessageEventResult | None:
         if not args:
-            return self._send_text(event, "❌ 用法: /gh settoken <token>\nToken 只保存在本机插件数据目录，不会上传。")
+            return self._send_text(event, "❌ 用法: /gh settoken <token>\nToken 只保存在本机插件数据目录（Windows 上加密存储），不会上传。")
         token = args[0].strip()
         if not re.fullmatch(r"[A-Za-z0-9_\-]+", token) or len(token) < 20:
             return self._send_text(event, "❌ Token 格式不正确（应为 GitHub Personal Access Token）")
-        # 先验证 Token 有效性
+        # 先验证 Token 有效性（验证失败一律不保存，避免固化坏 Token）
         old_token = self._state.get("token", "")
         self._state["token"] = token
         status, _ = await self._gh_request("/user")
         if status == 200:
+            from .secret import secure_store
+
+            self._state["token"] = secure_store(token)
             self._save_state()
-            return self._send_text(event, "✅ Token 已验证有效，已保存（仅本机存储）。")
+            return self._send_text(event, "✅ Token 已验证有效，已保存（Windows 加密存储，仅本机可读）。")
         elif status == 401:
             self._state["token"] = old_token  # 还原旧 Token
             return self._send_text(event, "❌ Token 无效（401 Unauthorized），未保存。")
+        elif status == 403:
+            self._state["token"] = old_token
+            return self._send_text(event, "❌ Token 验证被拒绝（403），可能无权限访问 /user，未保存。")
         else:
-            self._save_state()
-            return self._send_text(event, f"⚠️ 无法验证 Token（状态码 {status}），但已保存，请确认网络与 Token 权限。")
+            self._state["token"] = old_token
+            return self._send_text(event, f"⚠️ 无法验证 Token（状态码 {status}，可能是网络错误），未保存，请重试。")
 
     async def _cmd_sub(self, event: AstrMessageEvent, args: list[str]) -> MessageEventResult | None:
         session = event.unified_msg_origin
