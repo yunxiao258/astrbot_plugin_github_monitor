@@ -732,9 +732,17 @@ class GitHubMonitorPlugin(Star):
 
     # ========== 后台轮询 ==========
 
+    async def initialize(self) -> None:
+        """插件加载/重载时启动后台监控任务（幂等）"""
+        await self._start_monitor()
+
     @filter.on_astrbot_loaded()
     async def _on_astrbot_loaded(self) -> None:
-        """AstrBot 加载完成后启动后台监控任务"""
+        """AstrBot 启动时启动后台监控任务（初始化兜底，幂等）"""
+        await self._start_monitor()
+
+    async def _start_monitor(self) -> None:
+        """启动后台监控任务；已在运行时跳过"""
         if not self.config.get("enable_auto_check", True):
             logger.info("【github_monitor】自动检查已禁用，仅手动检查")
             return
