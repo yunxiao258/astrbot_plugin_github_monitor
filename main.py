@@ -131,8 +131,11 @@ class GitHubMonitorPlugin(Star):
         try:
             data = dict(self._state)
             data["initialized"] = sorted(self._state.get("initialized", set()))
-            with open(self._state_file, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._state_file)
         except Exception as e:
             logger.warning(f"保存状态文件失败: {e}")
 
@@ -750,12 +753,14 @@ class GitHubMonitorPlugin(Star):
             return
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
-        # 记录未捕获异常，避免任务静默死亡
-        self._monitor_task.add_done_callback(
-            lambda t: (
-                logger.error(f"监控任务异常退出: {t.exception()}") if not t.cancelled() and t.exception() else None
-            )
-        )
+
+        def _on_done(t: asyncio.Task):
+            # 任务退出（含异常/被取消）时复位标志，允许后续重新启动
+            self._running = False
+            if not t.cancelled() and t.exception():
+                logger.error(f"监控任务异常退出: {t.exception()}")
+
+        self._monitor_task.add_done_callback(_on_done)
         logger.info("【github_monitor】后台监控任务已启动")
 
     async def _monitor_loop(self):
