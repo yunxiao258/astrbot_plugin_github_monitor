@@ -1,11 +1,13 @@
 ﻿# -*- coding: utf-8 -*-
-"""github_monitor 插件单元测试：仓库解析、时间格式化、更新检测去重、并发广播"""
+"""github_monitor 插件单元测试：仓库解析、时间格式化、更新检测去重、并发广播、Star 趋势、标签过滤、每日日报"""
 import asyncio
 import copy
+import json
 import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.insert(0, r"D:\astrbot\data\plugins\astrbot_plugin_github_monitor")
 sys.path.insert(0, r"D:\astrbot\data\plugins")
@@ -36,16 +38,27 @@ def make_plugin(**overrides):
     }
     cfg.update(overrides)
     p = GitHubMonitorPlugin(context=None, config=cfg)
-    # 隔离持久化：重定向到临时目录，避免污染真实 state.json
+    # 隔离持久化：重定向到临时目录，避免污染真实 state/trends/daily_stats 文件
     tmp = tempfile.mkdtemp(prefix="gh_monitor_test_")
     p._state_file = os.path.join(tmp, "state.json")
+    p._trends_file = os.path.join(tmp, "trends.json")
+    p._daily_stats_file = os.path.join(tmp, "daily_stats.json")
     p._state = {
         "token": "",
         "repos": {},
         "subscribers": [],
         "initialized": set(),
     }
+    p._trends = {}
+    p._trend_alerts = {}
+    p._daily_stats = {}
+    p._daily_last_sent = ""
     return p
+
+
+def dstr(offset: int = 0) -> str:
+    """返回相对今天偏移 offset 天的 YYYY-MM-DD 日期字符串"""
+    return (datetime.now(TIMEZONE_BJ) + timedelta(days=offset)).strftime("%Y-%m-%d")
 
 
 class FakeResponse:
@@ -650,6 +663,425 @@ class TestCommands(unittest.TestCase):
         result = asyncio.run(p._cmd_settoken(ev, ["ghp_" + "z" * 30]))
         self.assertIn("无法验证", result[0].text)
         self.assertEqual(p._state["token"], "old_token")
+
+
+class TestStarTrends(unittest.TestCase):
+    """Star 趋势追踪：历史记录、30 天截断、24h/7d 变化率、阈值提醒、块字符图、命令"""
+
+    def test_record_star_same_day_dedupe(self):
+        p = make_plugin()
+        # 同一天两次记录只保留最新值
+        p._record_star("o/r", 100, date=dstr())
+        p._record_star("o/r", 120, date=dstr())
+        self.assertEqual(p._trends["o/r"][dstr()], 120)
+        self.assertEqual(len(p._trends["o/r"]), 1)
+
+    def test_record_star_no_yesterday_no_alert(self):
+        p = make_plugin(star_alert_threshold=1)
+        # 无昨日记录无法对比 → 不提醒，但记录仍写入
+        alert = p._record_star("o/r", 500, date=dstr())
+        self.assertIsNone(alert)
+        self.assertEqual(p._trends["o/r"][dstr()], 500)
+
+    def test_trim_trends_keeps_30_days(self):
+        p = make_plugin()
+        p._trends = {"o/r": {dstr(-(34 - i)): 100 + i for i in range(35)}}
+        GitHubMonitorPlugin._trim_trends(p._trends)
+        self.assertEqual(len(p._trends["o/r"]), 30)
+        self.assertIn(dstr(-29), p._trends["o/r"])
+        self.assertNotIn(dstr(-30), p._trends["o/r"])
+        # 全部过期的仓库被整体清除
+        p._trends["old"] = {dstr(-40): 1}
+        GitHubMonitorPlugin._trim_trends(p._trends)
+        self.assertNotIn("old", p._trends)
+
+    def test_star_change_24h_and_7d(self):
+        p = make_plugin()
+        p._trends = {"o/r": {dstr(-7): 90, dstr(-1): 100, dstr(): 130}}
+        c24 = p._star_change("o/r", 1)
+        self.assertEqual(c24[0], 30)  # 130 - 100
+        self.assertAlmostEqual(c24[1], 30.0)
+        c7 = p._star_change("o/r", 7)
+        self.assertEqual(c7[0], 40)  # 130 - 90
+        self.assertAlmostEqual(c7[1], 40.0 / 90 * 100)
+
+    def test_star_change_insufficient_data(self):
+        p = make_plugin()
+        self.assertIsNone(p._star_change("o/r", 1))  # 无数据
+        p._trends = {"o/r": {dstr(): 100}}
+        self.assertIsNone(p._star_change("o/r", 1))  # 仅一条记录
+        p._trends = {"o/r": {dstr(): 100, dstr(-1): 99}}
+        self.assertIsNone(p._star_change("o/r", 7))  # 对比日无记录
+
+    def test_star_change_fallback_to_earlier_record(self):
+        p = make_plugin()
+        # 对比日（7 天前）当天无记录时，回退到该日期之前最近的一条
+        p._trends = {"o/r": {dstr(-9): 80, dstr(-2): 95, dstr(): 105}}
+        c7 = p._star_change("o/r", 7)
+        self.assertEqual(c7[0], 25)
+
+    def test_star_alert_threshold_triggered(self):
+        p = make_plugin(star_alert_threshold=10)
+        p._trends = {"o/r": {dstr(-1): 100}}
+        alert = p._record_star("o/r", 120, date=dstr())
+        self.assertIsNotNone(alert)
+        self.assertIn("o/r", alert)
+        self.assertIn("+20", alert)
+        self.assertEqual(p._trend_alerts["o/r"], dstr())
+        # 同一天再次记录不重复提醒
+        self.assertIsNone(p._record_star("o/r", 125, date=dstr()))
+
+    def test_star_alert_below_threshold(self):
+        p = make_plugin(star_alert_threshold=10)
+        p._trends = {"o/r": {dstr(-1): 100}}
+        self.assertIsNone(p._record_star("o/r", 105, date=dstr()))
+
+    def test_star_alert_threshold_invalid_falls_back(self):
+        p = make_plugin(star_alert_threshold="abc")
+        p._trends = {"o/r": {dstr(-1): 100}}
+        # 非法阈值回退默认 10 → 增量 5 不触发
+        self.assertIsNone(p._record_star("o/r", 105, date=dstr()))
+        self.assertIsNotNone(p._record_star("o/r", 120, date=dstr()))
+
+    def test_build_star_chart(self):
+        p = make_plugin()
+        p._trends = {"o/r": {dstr(-i): 100 + i for i in range(6, -1, -1)}}
+        lines = p._build_star_chart("o/r", 7)
+        self.assertEqual(len(lines), 7)
+        self.assertIn(dstr(-6)[5:], lines[0])
+        self.assertTrue(any("█" in l for l in lines))  # 最高值应为满格
+
+    def test_build_star_chart_empty(self):
+        p = make_plugin()
+        self.assertEqual(p._build_star_chart("o/r", 7), [])
+        p._trends = {"o/r": {dstr(-20): 1}}
+        self.assertEqual(p._build_star_chart("o/r", 7), [])  # 7 天内无记录
+
+    def test_cmd_star_output(self):
+        p = make_plugin()
+        p._state["repos"] = {"o/r": {}}
+        p._trends = {"o/r": {dstr(-1): 100, dstr(): 110}}
+        p._session = FakeSession({"/repos/o/r": (200, {"stargazers_count": 110})})
+        result = asyncio.run(p._cmd_star(FakeEvent(), ["o/r"]))
+        text = result[0].text
+        self.assertIn("Star 趋势 [o/r]", text)
+        self.assertIn("24h:", text)
+        self.assertIn("+10", text)
+        self.assertIn("7d:", text)
+
+    def test_cmd_star_unknown_repo(self):
+        p = make_plugin()
+        result = asyncio.run(p._cmd_star(FakeEvent(), ["o/r"]))
+        self.assertIn("不在监控列表中", result[0].text)
+
+    def test_cmd_star_invalid_format(self):
+        p = make_plugin()
+        result = asyncio.run(p._cmd_star(FakeEvent(), ["bad"]))
+        self.assertIn("格式不正确", result[0].text)
+
+    def test_cmd_star_api_failure(self):
+        p = make_plugin()
+        p._state["repos"] = {"o/r": {}}
+        p._session = FakeSession({})  # 404 → 未缓存 → 视为失败
+        result = asyncio.run(p._cmd_star(FakeEvent(), ["o/r"]))
+        self.assertIn("失败", result[0].text)
+
+    def test_record_stars_today_skips_failed_api(self):
+        p = make_plugin()
+        p._state["repos"] = {"o/r": {}}
+        p._session = FakeSession({})  # 全部 404 → 不缓存 → 跳过
+        alerts = asyncio.run(p._record_stars_today(save=False))
+        self.assertEqual(alerts, [])
+        self.assertEqual(p._trends, {})
+
+    def test_record_stars_today_alerts(self):
+        p = make_plugin(star_alert_threshold=10)
+        p._state["repos"] = {"o/r": {}}
+        p._trends = {"o/r": {dstr(-1): 100}}
+        p._session = FakeSession({"/repos/o/r": (200, {"stargazers_count": 130})})
+        alerts = asyncio.run(p._record_stars_today(save=False))
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("+30", alerts[0])
+        # 已落盘记录
+        self.assertEqual(p._trends["o/r"][dstr()], 130)
+
+    def test_load_trends_dirty_data(self):
+        p = make_plugin()
+        with open(p._trends_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "_alerts": {"o/r": dstr(), "bad": 3},
+                "o/r": {dstr(): 100, "坏键": 1, dstr(-1): "x", dstr(-2): -5},
+                "bad": "not-a-dict",
+            }, f, ensure_ascii=False)
+        p._trends = p._load_trends()
+        self.assertEqual(p._trends["o/r"], {dstr(): 100})
+        self.assertEqual(p._trend_alerts, {"o/r": dstr()})
+        self.assertNotIn("bad", p._trends)
+
+    def test_save_trends_roundtrip(self):
+        p = make_plugin()
+        p._trends = {"o/r": {dstr(): 100}}
+        p._trend_alerts = {"o/r": dstr()}
+        p._save_trends()
+        # 重新加载验证持久化成功
+        p2 = make_plugin()
+        p2._trends_file = p._trends_file
+        p2._trends = p2._load_trends()
+        self.assertEqual(p2._trends["o/r"][dstr()], 100)
+        self.assertEqual(p2._trend_alerts["o/r"], dstr())
+
+    def test_save_trends_trims_on_write(self):
+        p = make_plugin()
+        p._trends = {"o/r": {dstr(-40): 1, dstr(): 100}}
+        p._save_trends()
+        self.assertNotIn(dstr(-40), p._trends["o/r"])
+
+
+class TestIssuePrTags(unittest.TestCase):
+    """Issue/PR 标签过滤：配置为空全通过、命中保留、未命中剔除且基线照常推进"""
+
+    ISSUE_BUG = {**ISSUE2, "labels": [{"name": "bug"}]}                  # number 2
+    ISSUE_FEATURE = {**ISSUE1, "labels": [{"name": "enhancement"}]}      # number 1
+    PR_BUG = {**PR2, "labels": [{"name": "bug"}]}                        # number 12
+    PR_NO_LABEL = {**PR1, "labels": []}                                  # number 11
+
+    def _repo_state(self):
+        return {
+            "last_commit": "", "last_release": "", "last_tag": "",
+            "last_issue": 1, "last_pr": 11,
+        }
+
+    def test_tags_empty_no_filter(self):
+        p = make_plugin()
+        self.assertTrue(p._matches_tags(self.ISSUE_BUG, []))
+        self.assertTrue(p._matches_tags({"labels": None}, []))
+        self.assertTrue(p._matches_tags({"labels": []}, []))
+        self.assertEqual(p._tag_list(""), [])
+        self.assertEqual(p._tag_list("   "), [])
+
+    def test_tag_parse(self):
+        p = make_plugin()
+        self.assertEqual(
+            p._tag_list("bug, enhancement，优化"), ["bug", "enhancement", "优化"]
+        )
+
+    def test_matches_tags_case_insensitive(self):
+        p = make_plugin()
+        self.assertTrue(p._matches_tags(self.ISSUE_BUG, ["BUG"]))
+        self.assertFalse(p._matches_tags(self.ISSUE_FEATURE, ["bug"]))
+
+    def test_issue_tags_filter_in_check(self):
+        p = make_plugin(issue_tags="bug")
+        p._state["repos"]["o/r"] = self._repo_state()
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({
+            "/issues": (200, [C(self.ISSUE_BUG), C(self.ISSUE_FEATURE)]),
+            "/pulls": (200, [C(self.PR_BUG), C(self.PR_NO_LABEL)]),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        kinds = {u["type"] for u in updates}
+        # issue_tags=bug：仅带 bug 标签的 Issue 保留；pull_tags 为空 → PR 全通过
+        self.assertEqual(kinds, {"issue", "pr"})
+        issue_group = next(u for u in updates if u["type"] == "issue")
+        self.assertEqual(len(issue_group["items"]), 1)
+        self.assertEqual(issue_group["items"][0]["number"], 2)
+        # 基线照常推进（被标签过滤的不重复推送）
+        self.assertEqual(p._state["repos"]["o/r"]["last_issue"], 2)
+        self.assertEqual(p._state["repos"]["o/r"]["last_pr"], 12)
+
+    def test_pull_tags_filter_in_check(self):
+        p = make_plugin(pull_tags="bug")
+        p._state["repos"]["o/r"] = self._repo_state()
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({
+            "/issues": (200, [C(self.ISSUE_BUG), C(self.ISSUE_FEATURE)]),
+            "/pulls": (200, [C(self.PR_BUG), C(self.PR_NO_LABEL)]),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        kinds = {u["type"] for u in updates}
+        self.assertEqual(kinds, {"issue", "pr"})
+        pr_group = next(u for u in updates if u["type"] == "pr")
+        self.assertEqual(len(pr_group["items"]), 1)
+        self.assertEqual(pr_group["items"][0]["number"], 12)
+
+    def test_tags_no_match_still_advances_baseline(self):
+        p = make_plugin(issue_tags="nonsense", pull_tags="nonsense")
+        p._state["repos"]["o/r"] = self._repo_state()
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({
+            "/issues": (200, [C(self.ISSUE_BUG), C(self.ISSUE_FEATURE)]),
+            "/pulls": (200, [C(self.PR_BUG), C(self.PR_NO_LABEL)]),
+        })
+        updates = asyncio.run(p._check_repo_updates("o/r"))
+        self.assertEqual(updates, [])
+        # 基线推进：被过滤条目不会重复推送
+        self.assertEqual(p._state["repos"]["o/r"]["last_issue"], 2)
+        self.assertEqual(p._state["repos"]["o/r"]["last_pr"], 12)
+
+
+class TestDailyReport(unittest.TestCase):
+    """每日趋势日报：统计累加、文本生成、定时发送、手动触发、30 天截断"""
+
+    def test_bump_daily_stats_accumulates(self):
+        p = make_plugin()
+        p._bump_daily_stats("o/r", {"commits": 2, "issues": 1})
+        p._bump_daily_stats("o/r", {"commits": 1, "prs": 3})
+        day = p._daily_stats["o/r"][dstr()]
+        self.assertEqual(day["commits"], 3)
+        self.assertEqual(day["issues"], 1)
+        self.assertEqual(day["prs"], 3)
+        self.assertEqual(day["releases"], 0)
+
+    def test_build_daily_report_content(self):
+        p = make_plugin()
+        p._state["repos"] = {"o/r": {}, "o/r2": {}}
+        p._daily_stats = {
+            "o/r": {dstr(-1): {"commits": 3, "releases": 1, "tags": 0, "issues": 2, "prs": 1}},
+            "o/r2": {dstr(-1): {"commits": 0, "releases": 0, "tags": 0, "issues": 0, "prs": 0}},
+        }
+        p._trends = {
+            "o/r": {dstr(-2): 100, dstr(-1): 110},
+            "o/r2": {dstr(-1): 120},  # 无更新统计但有 Star 记录 → 也应展示
+        }
+        report = p._build_daily_report()
+        self.assertIn("每日趋势日报", report)
+        self.assertIn(dstr(-1), report)
+        self.assertIn("o/r", report)
+        self.assertIn("提交 3", report)
+        self.assertIn("Issue 2", report)
+        self.assertIn("PR 1", report)
+        self.assertIn("100 → 110", report)
+        # 无统计但有 Star 记录的仓库也展示
+        self.assertIn("o/r2", report)
+
+    def test_build_daily_report_no_data(self):
+        p = make_plugin()
+        p._state["repos"] = {"o/r": {}}
+        report = p._build_daily_report()
+        self.assertIn("无任何数据", report)
+
+    def test_build_daily_report_no_repos(self):
+        p = make_plugin()
+        self.assertEqual(p._build_daily_report(), "")
+
+    def test_build_daily_report_star_no_prev(self):
+        p = make_plugin()
+        p._state["repos"] = {"o/r": {}}
+        p._trends = {"o/r": {dstr(-1): 110}}
+        report = p._build_daily_report()
+        self.assertIn("无前日对比", report)
+
+    def test_cmd_daily_manual(self):
+        p = make_plugin()
+        p._state["repos"] = {"o/r": {}}
+        p._daily_stats = {
+            "o/r": {dstr(-1): {"commits": 5, "releases": 0, "tags": 0, "issues": 0, "prs": 0}}
+        }
+        result = asyncio.run(p._cmd_daily(FakeEvent(), []))
+        self.assertIn("提交 5", result[0].text)
+        # 手动触发后标记当日已发送，定时任务不再重复
+        self.assertEqual(p._daily_last_sent, dstr())
+
+    def test_cmd_daily_no_repos(self):
+        p = make_plugin()
+        result = asyncio.run(p._cmd_daily(FakeEvent(), []))
+        self.assertIn("没有监控任何仓库", result[0].text)
+
+    def test_maybe_send_daily_after_time(self):
+        p = make_plugin(daily_report_time="00:00")  # 必然已过
+        p._state["repos"] = {"o/r": {}}
+        p._daily_stats = {
+            "o/r": {dstr(-1): {"commits": 2, "releases": 0, "tags": 0, "issues": 0, "prs": 0}}
+        }
+        sent = []
+
+        async def fake_send(msg):
+            sent.append(msg)
+
+        p._send_to_subscribers = fake_send
+        asyncio.run(p._maybe_send_daily_report())
+        self.assertEqual(len(sent), 1)
+        self.assertIn("提交 2", sent[0])
+        self.assertEqual(p._daily_last_sent, dstr())
+        # 同日再次调用不重复发送
+        asyncio.run(p._maybe_send_daily_report())
+        self.assertEqual(len(sent), 1)
+
+    def test_maybe_send_disabled(self):
+        p = make_plugin(daily_report_enabled=False, daily_report_time="00:00")
+        p._state["repos"] = {"o/r": {}}
+        p._daily_stats = {
+            "o/r": {dstr(-1): {"commits": 1, "releases": 0, "tags": 0, "issues": 0, "prs": 0}}
+        }
+        sent = []
+
+        async def fake_send(msg):
+            sent.append(msg)
+
+        p._send_to_subscribers = fake_send
+        asyncio.run(p._maybe_send_daily_report())
+        self.assertEqual(sent, [])
+        self.assertEqual(p._daily_last_sent, "")
+
+    def test_maybe_send_invalid_time_falls_back(self):
+        p = make_plugin(daily_report_time="abc")
+        p._state["repos"] = {"o/r": {}}
+        p._daily_stats = {
+            "o/r": {dstr(-1): {"commits": 1, "releases": 0, "tags": 0, "issues": 0, "prs": 0}}
+        }
+        sent = []
+
+        async def fake_send(msg):
+            sent.append(msg)
+
+        p._send_to_subscribers = fake_send
+        try:
+            asyncio.run(p._maybe_send_daily_report())
+        except Exception as e:
+            self.fail(f"非法时间应回退默认值而非抛异常: {e}")
+        # 非法时间回退 09:00：当前时间未到 09:00 则不发送，已到则发送（两者皆合理）
+        if datetime.now(TIMEZONE_BJ).hour < 9:
+            self.assertEqual(sent, [])
+        else:
+            self.assertEqual(p._daily_last_sent, dstr())
+
+    def test_daily_stats_save_trim_and_reload(self):
+        p = make_plugin()
+        p._daily_stats = {
+            "o/r": {
+                dstr(-40): {"commits": 1, "releases": 0, "tags": 0, "issues": 0, "prs": 0},
+                dstr(-1): {"commits": 2, "releases": 0, "tags": 0, "issues": 0, "prs": 0},
+            },
+        }
+        p._daily_last_sent = dstr()
+        p._save_daily_stats()
+        self.assertNotIn(dstr(-40), p._daily_stats["o/r"])
+        self.assertIn(dstr(-1), p._daily_stats["o/r"])
+        # 重新加载：元字段与截断生效
+        p2 = make_plugin()
+        p2._daily_stats_file = p._daily_stats_file
+        p2._daily_stats = p2._load_daily_stats()
+        self.assertEqual(p2._daily_last_sent, dstr())
+        self.assertNotIn(dstr(-40), p2._daily_stats["o/r"])
+        self.assertIn(dstr(-1), p2._daily_stats["o/r"])
+
+    def test_daily_stats_bump_through_check(self):
+        # 端到端：检查更新后 daily_stats 记录真实新增数（即使被关键词过滤仍计数）
+        p = make_plugin(keyword_filters="nonsense")
+        p._state["repos"]["o/r"] = {
+            "last_commit": "abc123", "last_release": "v1.0.0", "last_tag": "v1.0.0",
+        }
+        p._state["initialized"].add("o/r")
+        p._session = FakeSession({
+            "/commits": (200, [C(COMMIT2), C(COMMIT1)]),
+            "/releases": (200, [C(RELEASE)]),
+            "/tags": (200, [C(TAG)]),
+        })
+        asyncio.run(p._check_repo_updates("o/r"))
+        day = p._daily_stats["o/r"][dstr()]
+        self.assertEqual(day["commits"], 1)
+        self.assertEqual(day["releases"], 1)
+        self.assertEqual(day["tags"], 1)
 
 
 if __name__ == "__main__":

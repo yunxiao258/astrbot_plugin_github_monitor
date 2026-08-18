@@ -73,5 +73,30 @@
     "description": "是否启用 AI 摘要：用默认 LLM Provider 为新提交/新发布生成一句话摘要",
     "type": "bool",
     "default": false
+  },
+  "star_alert_threshold": {
+    "description": "Star 24h 增长提醒阈值：单仓库一天内 Star 增长达到该值（颗）时推送提醒订阅者，0 或留空为不提醒",
+    "type": "int",
+    "default": 10
+  },
+  "issue_tags": {
+    "description": "Issue 标签过滤：只推送带这些标签的新 Issue，多个用英文逗号或顿号分隔；留空推送全部",
+    "type": "string",
+    "default": ""
+  },
+  "pull_tags": {
+    "description": "PR 标签过滤：只推送带这些标签的新 Pull Request，多个用英文逗号或顿号分隔；留空推送全部",
+    "type": "string",
+    "default": ""
+  },
+  "daily_report_enabled": {
+    "description": "是否启用每日趋势日报：定时把各订阅仓库昨日更新数与 Star 变化推送给订阅者",
+    "type": "bool",
+    "default": true
+  },
+  "daily_report_time": {
+    "description": "每日趋势日报发送时间（24 小时制，如 09:00），留空或非法时回退 09:00",
+    "type": "string",
+    "default": "09:00"
   }
 }

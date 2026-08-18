@@ -19,7 +19,7 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_github_monitor"
 PLUGIN_AUTHOR = "Administrator"
 PLUGIN_DESC = "监控 GitHub 仓库更新，自动推送到群聊与私聊"
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.3.0"
 
 # GitHub API 基础地址与请求头
 GITHUB_API = "https://api.github.com"
@@ -35,6 +35,12 @@ _FETCH_PER_PAGE = 30
 _REPO_INFO_TTL = 600
 # Issue/PR 拉取条数：issue/pr 动态远多于提交，10 条足够且省 API 配额
 _ISSUE_PER_PAGE = 10
+# Star 趋势历史保留天数（自动截断更早的数据）
+_TREND_KEEP_DAYS = 30
+# 每日更新统计保留天数
+_DAILY_KEEP_DAYS = 30
+# Star 趋势块字符图：由低到高 8 级
+_TREND_CHART_BARS = "▁▂▃▄▅▆▇█"
 
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION)
@@ -56,6 +62,15 @@ class GitHubMonitorPlugin(Star):
         # 状态文件（持久化：token、监控仓库、订阅会话、上次已知更新位置）
         self._state_file = os.path.join(self.data_dir, "state.json")
         self._state = self._load_state()
+
+        # Star 趋势历史文件（trends.json：各仓库按日期记录的 Star 数 + 提醒状态）
+        self._trends_file = os.path.join(self.data_dir, "trends.json")
+        self._trends = self._load_trends()
+
+        # 每日更新统计文件（daily_stats.json：各仓库按日期记录的各类更新计数）
+        self._daily_stats_file = os.path.join(self.data_dir, "daily_stats.json")
+        self._daily_stats = self._load_daily_stats()
+        # 当日日报是否已发送（持久化到 daily_stats.json 的 _last_sent 元字段）
 
         # 将配置中的默认仓库合并进监控列表（已存在的则不覆盖）
         self._merge_default_repos()
@@ -138,6 +153,136 @@ class GitHubMonitorPlugin(Star):
             os.replace(tmp, self._state_file)
         except Exception as e:
             logger.warning(f"保存状态文件失败: {e}")
+
+    # ---------- Star 趋势历史（trends.json） ----------
+    # 结构：{repo: {日期(YYYY-MM-DD): star 数}}，另以 "_alerts" 键记录
+    # 各仓库当日是否已推送过 24h 增长提醒（避免同一天重复打扰）
+
+    def _load_trends(self) -> dict:
+        """加载 Star 历史；提醒状态存入 self._trend_alerts，返回 {repo: {日期: star}}"""
+        self._trend_alerts: dict[str, str] = {}
+        data: dict = {}
+        try:
+            if os.path.exists(self._trends_file):
+                with open(self._trends_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception as e:
+            logger.warning(f"加载 Star 历史失败: {e}")
+        # 剥离提醒状态（键以 _ 开头且不含 /，不会与仓库名冲突）
+        alerts = data.pop("_alerts", {})
+        if isinstance(alerts, dict):
+            self._trend_alerts = {
+                str(k): str(v)
+                for k, v in alerts.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+        # 类型防御：非法条目（键非日期、值非 int 或负数）直接丢弃
+        cleaned: dict = {}
+        for repo, hist in data.items():
+            if not isinstance(hist, dict):
+                continue
+            day_map = {}
+            for day, val in hist.items():
+                if not isinstance(day, str) or not isinstance(val, int) or val < 0:
+                    continue
+                try:
+                    datetime.strptime(day, "%Y-%m-%d")
+                except ValueError:
+                    continue  # 非日期键直接丢弃
+                day_map[day] = val
+            if day_map:
+                cleaned[repo] = day_map
+        self._trim_trends(cleaned)  # 加载即截断，防止文件长期膨胀
+        return cleaned
+
+    def _save_trends(self):
+        """保存 Star 历史到磁盘（原子写，写前自动 30 天截断）"""
+        try:
+            self._trim_trends(self._trends)
+            data = dict(self._trends)
+            data["_alerts"] = self._trend_alerts
+            os.makedirs(os.path.dirname(self._trends_file), exist_ok=True)
+            tmp = self._trends_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._trends_file)
+        except Exception as e:
+            logger.warning(f"保存 Star 历史失败: {e}")
+
+    @staticmethod
+    def _trim_trends(trends: dict, keep_days: int = _TREND_KEEP_DAYS) -> None:
+        """就地截断 Star 历史：仅保留最近 keep_days 天（YYYY-MM-DD 字符串按字典序比较）"""
+        cutoff = (
+            datetime.now(TIMEZONE_BJ) - timedelta(days=keep_days - 1)
+        ).strftime("%Y-%m-%d")
+        for repo in list(trends.keys()):
+            kept = {d: v for d, v in trends[repo].items() if d >= cutoff}
+            if kept:
+                trends[repo] = kept
+            else:
+                trends.pop(repo, None)
+
+    # ---------- 每日更新统计（daily_stats.json） ----------
+    # 结构：{repo: {日期: {"commits": n, "releases": n, "tags": n, "issues": n, "prs": n}}}
+    # 另以 "_last_sent" 键记录最近一次日报发送日期（防止定时重复发送）
+
+    def _load_daily_stats(self) -> dict:
+        """加载每日更新统计；最近日报发送日期存入 self._daily_last_sent"""
+        self._daily_last_sent = ""
+        data: dict = {}
+        try:
+            if os.path.exists(self._daily_stats_file):
+                with open(self._daily_stats_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception as e:
+            logger.warning(f"加载每日统计失败: {e}")
+        self._daily_last_sent = str(data.pop("_last_sent", "") or "")
+        # 类型防御：非法条目直接丢弃
+        cleaned: dict = {}
+        for repo, days in data.items():
+            if not isinstance(days, dict):
+                continue
+            day_map = {}
+            for day, vals in days.items():
+                if not isinstance(day, str) or not isinstance(vals, dict):
+                    continue
+                day_map[day] = {
+                    k: int(v)
+                    for k, v in vals.items()
+                    if k in ("commits", "releases", "tags", "issues", "prs")
+                    and isinstance(v, int)
+                }
+            if day_map:
+                cleaned[repo] = day_map
+        return cleaned
+
+    def _save_daily_stats(self):
+        """保存每日更新统计（原子写，写前自动 30 天截断）"""
+        try:
+            cutoff = (
+                datetime.now(TIMEZONE_BJ) - timedelta(days=_DAILY_KEEP_DAYS - 1)
+            ).strftime("%Y-%m-%d")
+            for repo in list(self._daily_stats.keys()):
+                self._daily_stats[repo] = {
+                    d: v
+                    for d, v in self._daily_stats[repo].items()
+                    if d >= cutoff
+                }
+                if not self._daily_stats[repo]:
+                    self._daily_stats.pop(repo, None)
+            data = dict(self._daily_stats)
+            data["_last_sent"] = self._daily_last_sent
+            os.makedirs(os.path.dirname(self._daily_stats_file), exist_ok=True)
+            tmp = self._daily_stats_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._daily_stats_file)
+        except Exception as e:
+            logger.warning(f"保存每日统计失败: {e}")
 
     # ========== 工具方法 ==========
 
@@ -373,6 +518,24 @@ class GitHubMonitorPlugin(Star):
                 filtered.append({"type": kind, "items": kept})
         return filtered
 
+    def _tag_list(self, raw: str) -> list[str]:
+        """解析标签过滤配置（逗号/顿号分隔，去空，小写）"""
+        return [t.strip().lower() for t in re.split(r"[,，、]", raw or "") if t.strip()]
+
+    @staticmethod
+    def _matches_tags(item: dict, tags: list[str]) -> bool:
+        """判断 issue/pr 是否命中任一标签（大小写不敏感）；tags 为空则全部通过"""
+        tags = [str(t).lower() for t in tags if t]  # 统一小写，调用方大小写随意
+        if not tags:
+            return True
+        labels = item.get("labels") or []
+        names = [
+            (l.get("name") or "") if isinstance(l, dict) else ""
+            for l in labels
+        ]
+        text = " ".join(names).lower()
+        return any(tag in text for tag in tags)
+
     async def _summarize(self, text: str, context_hint: str) -> str | None:
         """用 LLM 生成更新摘要，失败或无 provider 时返回 None"""
         if not self.config.get("enable_ai_summary", False):
@@ -459,6 +622,8 @@ class GitHubMonitorPlugin(Star):
         if min_stars > 0 and await self._get_repo_stars(repo) < min_stars:
             return []
         updates: list[dict] = []
+        # 本次检查各类型新增计数（记录真实新增量，供每日趋势日报使用）
+        stats_delta = {"commits": 0, "releases": 0, "tags": 0, "issues": 0, "prs": 0}
 
         # 1. 新提交
         commits = await self._get_commits(repo, per_page=_FETCH_PER_PAGE)
@@ -475,6 +640,7 @@ class GitHubMonitorPlugin(Star):
                 repo_state["last_commit"] = latest_sha
                 # 翻转：API 返回最新在前
                 new_commits.reverse()
+                stats_delta["commits"] = len(new_commits)  # 真实新增数（截断前）
                 new_commits = new_commits[:max_events]  # 通知条数上限
                 if new_commits:
                     # 预取变更统计（异步），供消息构建使用
@@ -505,6 +671,7 @@ class GitHubMonitorPlugin(Star):
                             break
                         new_releases.append(r)
                     new_releases.reverse()
+                    stats_delta["releases"] = len(new_releases)  # 真实新增数（截断前）
                     new_releases = new_releases[:max_events]  # 通知条数上限
                     if new_releases:
                         repo_state["last_release"] = releases[0].get("tag_name", "")
@@ -526,6 +693,7 @@ class GitHubMonitorPlugin(Star):
                             break
                         new_tags.append(t)
                     new_tags.reverse()
+                    stats_delta["tags"] = len(new_tags)  # 真实新增数（截断前）
                     new_tags = new_tags[:max_events]  # 通知条数上限
                     if new_tags:
                         repo_state["last_tag"] = tags[0].get("name", "")
@@ -550,8 +718,13 @@ class GitHubMonitorPlugin(Star):
                         repo_state["last_issue"] = max(
                             self._safe_int(issues[0].get("number", 0), 0), last_issue
                         )
-                        await self._attach_summaries("issue", new_issues)
-                        updates.append({"type": "issue", "items": new_issues})
+                        stats_delta["issues"] = len(new_issues)
+                        # 标签过滤：issue_tags 为空则全部通过（纯内存操作，不额外请求 API）
+                        issue_tags = self._tag_list(self.config.get("issue_tags", ""))
+                        kept = [i for i in new_issues if self._matches_tags(i, issue_tags)]
+                        if kept:
+                            await self._attach_summaries("issue", kept)
+                            updates.append({"type": "issue", "items": kept})
                 else:
                     repo_state["last_issue"] = self._safe_int(
                         issues[0].get("number", 0), 0
@@ -574,10 +747,19 @@ class GitHubMonitorPlugin(Star):
                         repo_state["last_pr"] = max(
                             self._safe_int(pulls[0].get("number", 0), 0), last_pr
                         )
-                        await self._attach_summaries("pr", new_prs)
-                        updates.append({"type": "pr", "items": new_prs})
+                        stats_delta["prs"] = len(new_prs)
+                        # 标签过滤：pull_tags 为空则全部通过（纯内存操作，不额外请求 API）
+                        pull_tags = self._tag_list(self.config.get("pull_tags", ""))
+                        kept = [p for p in new_prs if self._matches_tags(p, pull_tags)]
+                        if kept:
+                            await self._attach_summaries("pr", kept)
+                            updates.append({"type": "pr", "items": kept})
                 else:
                     repo_state["last_pr"] = self._safe_int(pulls[0].get("number", 0), 0)
+
+        # 累计每日更新统计（含被关键词/标签过滤掉的条目，反映真实新增量）
+        if any(stats_delta.values()):
+            self._bump_daily_stats(repo, stats_delta)
 
         # 关键词过滤 + 标记已初始化基线
         updates = self._filter_updates(updates)
@@ -586,6 +768,7 @@ class GitHubMonitorPlugin(Star):
 
         if save:
             self._save_state()
+            self._save_daily_stats()
         return updates
 
     # ========== 消息构建与推送 ==========
@@ -722,6 +905,7 @@ class GitHubMonitorPlugin(Star):
                 return_exceptions=True,
             )
             self._save_state()
+            self._save_daily_stats()
         for repo, result in zip(repos, results):
             try:
                 if isinstance(result, Exception):
@@ -764,14 +948,222 @@ class GitHubMonitorPlugin(Star):
         logger.info("【github_monitor】后台监控任务已启动")
 
     async def _monitor_loop(self):
-        """后台轮询循环（配置非法时回退默认间隔，任务不会死亡）"""
+        """后台轮询循环（配置非法时回退默认间隔，任务不会死亡）
+        每轮依次：检查更新推送 → 记录 Star 趋势 → 判断是否到点发送每日日报"""
         interval = max(1, self._safe_int(self.config.get("check_interval_minutes", 5), 5)) * 60
         while self._running:
             try:
                 await self._broadcast_updates()
+                # Star 趋势记录（同天去重；24h 增长达阈值推送提醒）
+                for alert in await self._record_stars_today():
+                    await self._send_to_subscribers(alert)
+                # 每日趋势日报（到配置时间且当日未发送过）
+                await self._maybe_send_daily_report()
             except Exception as e:
                 logger.error(f"定时检查仓库更新失败: {e}")
             await asyncio.sleep(interval)
+
+    # ========== Star 趋势追踪 ==========
+
+    def _record_star(self, repo: str, stars: int, date: str | None = None) -> str | None:
+        """记录单仓库当日 Star 数（同天只保留最新值）并检测 24h 增长提醒；
+        返回提醒文本（无需提醒或数据不足返回 None）"""
+        date = date or datetime.now(TIMEZONE_BJ).strftime("%Y-%m-%d")
+        hist = self._trends.setdefault(repo, {})
+        if hist.get(date) == stars:
+            return None  # 同值不重复写
+        hist[date] = stars
+        self._trim_trends(self._trends)  # 写后即时截断，防止文件膨胀
+        # 24h 增长提醒：需有昨日记录可对比，且当日未提醒过
+        threshold = max(1, self._safe_int(self.config.get("star_alert_threshold", 10), 10))
+        try:
+            yesterday = (
+                datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+        prev = hist.get(yesterday)
+        if prev is None:
+            return None
+        delta = stars - prev
+        if delta >= threshold and self._trend_alerts.get(repo) != date:
+            self._trend_alerts[repo] = date  # 同一天只提醒一次
+            return self._build_star_alert(repo, stars, delta, prev)
+        return None
+
+    async def _record_stars_today(self, save: bool = True) -> list[str]:
+        """随监控循环记录各仓库今日 Star 数（_get_repo_stars 带 TTL 缓存，不额外耗配额）；
+        返回需要推送的 24h 增长提醒文本列表；API 失败/无缓存的仓库静默跳过"""
+        alerts: list[str] = []
+        repos = list(self._state.get("repos", {}).keys())
+        if not repos:
+            return alerts
+        for repo in repos:
+            try:
+                stars = await self._get_repo_stars(repo)
+                if repo not in self._repo_info_cache:
+                    continue  # 请求失败（未缓存），跳过避免写入脏数据 0
+                alert = self._record_star(repo, stars)
+                if alert:
+                    alerts.append(alert)
+            except Exception as e:
+                logger.warning(f"记录 {repo} Star 趋势失败: {e}")
+        if save:
+            self._save_trends()
+        return alerts
+
+    def _star_change(self, repo: str, days: int) -> tuple[int, float, int, int] | None:
+        """计算仓库距今天 days 天的 Star 变化；
+        返回 (变化量, 变化率%, 当前值, 对比值)；历史不足两条或对比日无数据返回 None"""
+        hist = self._trends.get(repo) or {}
+        if len(hist) < 2:
+            return None
+        sorted_items = sorted(hist.items())  # 按日期升序（YYYY-MM-DD 字典序即时间序）
+        cur_val = sorted_items[-1][1]  # 最近一次记录（今天或最近运行日）
+        today = datetime.now(TIMEZONE_BJ).date()
+        target = today - timedelta(days=days)
+        prev_val: int | None = None
+        for d, v in sorted_items:
+            try:
+                d_obj = datetime.strptime(d, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if d_obj <= target:
+                prev_val = v
+            else:
+                break
+        if prev_val is None:
+            return None
+        delta = cur_val - prev_val
+        rate = (delta / prev_val * 100.0) if prev_val else 0.0
+        return delta, rate, cur_val, prev_val
+
+    def _build_star_chart(self, repo: str, days: int = 7) -> list[str]:
+        """生成近 days 天 Star 趋势块字符文本图（每行: 日期 块符 数值）；
+        无数据返回空列表"""
+        hist = self._trends.get(repo) or {}
+        if not hist:
+            return []
+        today = datetime.now(TIMEZONE_BJ).date()
+        start = today - timedelta(days=days - 1)
+        points = []
+        for i in range(days):
+            d = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+            if d in hist:
+                points.append((d, hist[d]))
+        if not points:
+            return []
+        lo = min(v for _, v in points)
+        hi = max(v for _, v in points)
+        span = (hi - lo) or 1  # 全相等时避免除零
+        bars = _TREND_CHART_BARS
+        lines = []
+        for d, v in points:
+            level = int((v - lo) / span * (len(bars) - 1) + 0.5)
+            lines.append(f"{d[5:]} {bars[level]} {v}")
+        return lines
+
+    def _build_star_alert(self, repo: str, stars: int, delta: int, prev: int) -> str:
+        """构建 Star 24h 增长提醒文本"""
+        rate = (delta / prev * 100.0) if prev else 0.0
+        return (
+            f"⭐ Star 增长提醒 [{repo}]\n"
+            f"当前 {stars} 颗，24h 内 +{delta}（{rate:+.1f}%）"
+        )
+
+    # ========== 每日趋势日报 ==========
+
+    def _bump_daily_stats(self, repo: str, delta: dict) -> None:
+        """将本次检查发现的新增条目数累加到当日统计（纯内存操作，保存由调用方负责）"""
+        date = datetime.now(TIMEZONE_BJ).strftime("%Y-%m-%d")
+        day = self._daily_stats.setdefault(repo, {}).setdefault(
+            date, {"commits": 0, "releases": 0, "tags": 0, "issues": 0, "prs": 0}
+        )
+        for key, val in delta.items():
+            if val:
+                day[key] = int(day.get(key, 0) or 0) + int(val)
+
+    def _build_daily_report(self, date_str: str | None = None) -> str:
+        """生成指定日期（默认昨日）的趋势日报纯文本；
+        数据来源：daily_stats.json（更新计数）+ trends.json（Star 变化），不请求 API"""
+        date = date_str or (
+            datetime.now(TIMEZONE_BJ) - timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+        try:
+            prev_date = (
+                datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            prev_date = ""
+        repos = list(self._state.get("repos", {}).keys())
+        if not repos:
+            return ""
+        lines = [f"📊 GitHub 每日趋势日报（{date}）", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        any_data = False
+        for repo in repos:
+            day = (self._daily_stats.get(repo) or {}).get(date)
+            has_stats = day is not None and any(day.get(k, 0) for k in
+                                                ("commits", "releases", "tags", "issues", "prs"))
+            # Star 变化：date vs 前一天（来自 trends.json）
+            hist = self._trends.get(repo) or {}
+            cur, prev = hist.get(date), hist.get(prev_date) if prev_date else None
+            star_txt = "—"
+            if cur is not None and prev is not None:
+                delta = cur - prev
+                rate = (delta / prev * 100.0) if prev else 0.0
+                star_txt = f"{prev} → {cur}（{delta:+d}，{rate:+.1f}%）"
+            elif cur is not None:
+                star_txt = f"{cur}（无前日对比）"
+            if not has_stats and cur is None:
+                continue  # 该仓库昨日完全无数据（未运行或未检查），跳过
+            any_data = True
+            lines.append(f"📍 {repo}")
+            if has_stats:
+                lines.append(
+                    f"  🆕 提交 {day.get('commits', 0)} | 🏷️ 发布 {day.get('releases', 0)}"
+                    f" | 🔖 标签 {day.get('tags', 0)}"
+                    f" | 🐛 Issue {day.get('issues', 0)} | 🛠️ PR {day.get('prs', 0)}"
+                )
+            else:
+                lines.append("  🆕 昨日无新增提交/发布/标签/Issue/PR")
+            lines.append(f"  ⭐ Star: {star_txt}")
+        if not any_data:
+            return (
+                f"📊 GitHub 每日趋势日报（{date}）\n"
+                "昨日无任何数据。请确认插件在昨日处于运行状态。"
+            )
+        return "\n".join(lines)
+
+    async def _maybe_send_daily_report(self) -> None:
+        """每日定时发送趋势日报：到达配置时间（默认 09:00）且当日未发送过；
+        定时任务并入 _monitor_loop，由 initialize()/terminate() 生命周期统一管理"""
+        if not self.config.get("daily_report_enabled", True):
+            return
+        now = datetime.now(TIMEZONE_BJ)
+        today = now.strftime("%Y-%m-%d")
+        if self._daily_last_sent == today:
+            return
+        # 解析配置时间（如 "09:00"/"9:00"），非法回退默认 09:00
+        time_str = str(self.config.get("daily_report_time", "09:00") or "09:00").strip()
+        target = None
+        try:
+            target = datetime.strptime(f"{today} {time_str}", "%Y-%m-%d %H:%M").replace(
+                tzinfo=TIMEZONE_BJ
+            )
+        except ValueError:
+            try:
+                target = datetime.strptime(f"{today} 09:00", "%Y-%m-%d %H:%M").replace(
+                    tzinfo=TIMEZONE_BJ
+                )
+            except ValueError:
+                return
+        if now < target:
+            return  # 未到点
+        report = self._build_daily_report()
+        if report:
+            await self._send_to_subscribers(report)
+        self._daily_last_sent = today
+        self._save_daily_stats()
 
     async def _manual_check(self, repo: str | None = None):
         """手动检查：指定仓库或全部，返回结果文本"""
@@ -813,6 +1205,8 @@ class GitHubMonitorPlugin(Star):
             "list": self._cmd_list,
             "repos": self._cmd_repos,
             "check": self._cmd_check,
+            "star": self._cmd_star,
+            "daily": self._cmd_daily,
             "settoken": self._cmd_settoken,
             "token": self._cmd_settoken,
             "sub": self._cmd_sub,
@@ -927,6 +1321,55 @@ class GitHubMonitorPlugin(Star):
         result = await self._manual_check(repo)
         return self._send_text(event, result)
 
+    async def _cmd_star(self, event: AstrMessageEvent, args: list[str]) -> MessageEventResult | None:
+        """查看仓库近 7 天 Star 趋势（块字符文本图 + 24h/7d 变化数据）"""
+        if not args:
+            return self._send_text(event, "❌ 用法: /gh star owner/repo")
+        repo = self._parse_repo(args[0])
+        if not repo:
+            return self._send_text(event, "❌ 仓库格式不正确，应为 owner/repo，例如: /gh star yunxiao258/astrbot_plugin_context_analyzer")
+        if repo not in self._state.get("repos", {}):
+            return self._send_text(event, f"ℹ️ 仓库 {repo} 不在监控列表中，先 /gh add {repo}")
+        # 先刷新今日 Star（命中 TTL 缓存则不额外请求 API），并顺手落盘记录
+        try:
+            stars = await self._get_repo_stars(repo)
+        except Exception as e:
+            logger.warning(f"获取 {repo} Star 失败: {e}")
+            return self._send_text(event, f"❌ 获取 {repo} Star 数失败，请稍后再试")
+        if repo not in self._repo_info_cache:
+            return self._send_text(event, f"❌ 获取 {repo} Star 数失败，请稍后再试")
+        self._record_star(repo, stars)
+        self._save_trends()
+        lines = [f"⭐ Star 趋势 [{repo}]（近 7 天）", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        chart = self._build_star_chart(repo, 7)
+        if not chart:
+            return self._send_text(event, f"📭 仓库 {repo} 暂无 Star 历史数据，稍后重试")
+        lines.extend(chart)
+        c24 = self._star_change(repo, 1)
+        c7 = self._star_change(repo, 7)
+        lines.append("")
+        if c24:
+            d, r, cur, prev = c24
+            lines.append(f"24h: {prev} → {cur}（{d:+d}，{r:+.1f}%）")
+        else:
+            lines.append("24h: 数据不足")
+        if c7:
+            d, r, cur, prev = c7
+            lines.append(f"7d:  {prev} → {cur}（{d:+d}，{r:+.1f}%）")
+        else:
+            lines.append("7d:  数据不足")
+        return self._send_text(event, "\n".join(lines))
+
+    async def _cmd_daily(self, event: AstrMessageEvent, args: list[str]) -> MessageEventResult | None:
+        """手动触发每日趋势日报（汇总各订阅仓库昨日数据）"""
+        report = self._build_daily_report()
+        if not report:
+            return self._send_text(event, "📭 当前没有监控任何仓库，无法生成日报。")
+        # 手动触发后标记当日已发送，避免定时任务重复推送
+        self._daily_last_sent = datetime.now(TIMEZONE_BJ).strftime("%Y-%m-%d")
+        self._save_daily_stats()
+        return self._send_text(event, report)
+
     async def _cmd_settoken(self, event: AstrMessageEvent, args: list[str]) -> MessageEventResult | None:
         if not args:
             return self._send_text(event, "❌ 用法: /gh settoken <token>\nToken 只保存在本机插件数据目录（Windows 上加密存储），不会上传。")
@@ -981,12 +1424,15 @@ class GitHubMonitorPlugin(Star):
             "/gh list             查看监控列表\n"
             "/gh repos            查看个人仓库列表\n"
             "/gh check [repo]     立即检查更新（可指定仓库）\n"
+            "/gh star owner/repo  查看近 7 天 Star 趋势图\n"
+            "/gh daily            手动发送每日趋势日报\n"
             "/gh settoken <token> 设置 GitHub Token\n"
             "/gh 订阅 / 退订      订阅或退订本会话推送\n"
             "/gh help             查看帮助\n"
             "\n"
             "💡 定时自动检查默认每 5 分钟一次；使用过指令的会话会自动订阅推送。\n"
-            "💡 过滤配置：keyword_filters 命中关键词才推送，min_stars 按星标数过滤，enable_ai_summary 启用 AI 摘要。"
+            "💡 过滤配置：keyword_filters 命中关键词才推送，issue_tags/pull_tags 按标签过滤，min_stars 按星标数过滤，enable_ai_summary 启用 AI 摘要。\n"
+            "💡 Star 趋势与每日日报：star_alert_threshold 设置 24h 增长提醒阈值，daily_report_time 设置日报发送时间。"
         )
         return self._send_text(event, help_text)
 
