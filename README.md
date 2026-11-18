@@ -94,6 +94,11 @@ AstrBot 插件：监控 GitHub 仓库更新（提交 / Release / 标签 / Issue 
 
 ## 更新记录
 
+### v1.3.1
+- GitHub API 会话启用 `trust_env=True` 并新增可选 `proxy` 代理配置与 20 秒连接/读取超时，改善国内直连/系统代理环境请求超时问题
+- `_send_to_subscribers` 推送前识别已加载平台，跳过离线/已失效平台会话并记录详细异常类型，避免刷屏告警
+- 移除冗余 `on_astrbot_loaded` 重复触发，统一作者为 `云晓`、清理测试硬编码路径并接入 GitHub Actions CI
+
 ### v1.3.0
 
 - 新增 Star 趋势追踪：自动记录每日 Star 数，`/gh star` 查看近 7 天趋势图与 24h / 7d 变化，`star_alert_threshold` 支持 24h 增长阈值提醒

@@ -1,4 +1,4 @@
-﻿"""AstrBot GitHub 仓库监控插件：监控仓库更新（提交/发布/标签），自动推送到群聊与私聊"""
+"""AstrBot GitHub 仓库监控插件：监控仓库更新（提交/发布/标签），自动推送到群聊与私聊"""
 
 import asyncio
 import json
@@ -17,15 +17,15 @@ from astrbot.api.star import Context, Star, register
 
 # 插件元数据
 PLUGIN_NAME = "astrbot_plugin_github_monitor"
-PLUGIN_AUTHOR = "Administrator"
+PLUGIN_AUTHOR = "云晓"
 PLUGIN_DESC = "监控 GitHub 仓库更新，自动推送到群聊与私聊"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 
 # GitHub API 基础地址与请求头
 GITHUB_API = "https://api.github.com"
 GITHUB_USER_AGENT = "astrbot-plugin-github-monitor"
 TIMEZONE_BJ = timezone(timedelta(hours=8))  # 北京时间 UTC+8
-DEFAULT_TIMEOUT = 15  # HTTP 请求超时（秒）
+DEFAULT_TIMEOUT = 20  # HTTP 请求超时（秒）
 # AI 摘要并发限流：防止多仓库同时调用 LLM 打爆 provider
 _SUMMARY_SEM = asyncio.Semaphore(2)
 # API 拉取条数：固定较大值避免两轮检查间隔内更新超过 per_page 导致基线外更新丢失
@@ -349,10 +349,11 @@ class GitHubMonitorPlugin(Star):
             return int(default)
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """获取（或创建）复用的 aiohttp 会话"""
+        """获取（或创建）复用的 aiohttp 会话（默认信任环境变量代理）"""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT, connect=10),
+                trust_env=True,
                 headers={
                     "User-Agent": GITHUB_USER_AGENT,
                     "Accept": "application/vnd.github+json",
@@ -370,8 +371,10 @@ class GitHubMonitorPlugin(Star):
         session = await self._get_session()
         url = f"{GITHUB_API}{path}"
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        proxy = str(self.config.get("proxy", "") or "").strip()
+        req_kw = {"proxy": proxy} if proxy else {}
         try:
-            async with session.get(url, params=params, headers=headers) as resp:
+            async with session.get(url, params=params, headers=headers, **req_kw) as resp:
                 status = resp.status
                 if status == 204:
                     return status, None
@@ -882,16 +885,40 @@ class GitHubMonitorPlugin(Star):
 
         return "\n".join(lines)
 
+    def _active_platform_ids(self) -> set[str] | None:
+        """返回当前已加载的平台 ID 集合；无法检测时返回 None"""
+        try:
+            pm = getattr(self.context, "platform_manager", None)
+            if pm is None or not hasattr(pm, "get_insts"):
+                return None
+            ids: set[str] = set()
+            for inst in pm.get_insts() or []:
+                meta = getattr(inst, "metadata", None)
+                if meta is None and callable(getattr(inst, "meta", None)):
+                    meta = inst.meta()
+                pid = getattr(meta, "id", None) or getattr(inst, "platform_id", None)
+                if pid:
+                    ids.add(str(pid))
+            return ids or None
+        except Exception:
+            return None
+
     async def _send_to_subscribers(self, message: str):
-        """向所有订阅会话推送消息"""
+        """向所有活跃订阅会话推送消息"""
         if not message:
             return
+        active = self._active_platform_ids()
         chain = MessageChain([Plain(message)])
         for session in self._subscribers():
+            platform_id = session.split(":", 1)[0] if ":" in session else ""
+            if active is not None and platform_id and platform_id not in active:
+                logger.debug(f"跳过未加载平台订阅会话: {session}")
+                continue
             try:
                 await self.context.send_message(session, chain)
             except Exception as e:
-                logger.warning(f"向会话 {session} 推送失败: {e}")
+                err_txt = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                logger.warning(f"向会话 {session} 推送失败: {err_txt}")
 
     async def _broadcast_updates(self):
         """并发检查所有仓库并将更新推送到订阅会话"""
@@ -923,17 +950,16 @@ class GitHubMonitorPlugin(Star):
         """插件加载/重载时启动后台监控任务（幂等）"""
         await self._start_monitor()
 
-    @filter.on_astrbot_loaded()
-    async def _on_astrbot_loaded(self) -> None:
-        """AstrBot 启动时启动后台监控任务（初始化兜底，幂等）"""
-        await self._start_monitor()
-
     async def _start_monitor(self) -> None:
         """启动后台监控任务；已在运行时跳过"""
         if not self.config.get("enable_auto_check", True):
             logger.info("【github_monitor】自动检查已禁用，仅手动检查")
             return
         if self._running:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
             return
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())

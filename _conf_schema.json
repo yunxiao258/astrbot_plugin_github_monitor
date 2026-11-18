@@ -14,6 +14,11 @@
     "type": "string",
     "default": ""
   },
+  "proxy": {
+    "description": "HTTP 代理地址（如 http://127.0.0.1:7890；留空时自动读取系统代理环境变量）",
+    "type": "string",
+    "default": ""
+  },
   "default_repos": {
     "description": "默认监控的仓库列表，格式 owner/repo，多个用英文逗号分隔；运行中可用 /gh add 动态添加",
     "type": "string",

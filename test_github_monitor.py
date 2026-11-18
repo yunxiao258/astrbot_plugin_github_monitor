@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """github_monitor 插件单元测试：仓库解析、时间格式化、更新检测去重、并发广播、Star 趋势、标签过滤、每日日报"""
 import asyncio
 import copy
@@ -9,8 +9,9 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 
-sys.path.insert(0, r"D:\astrbot\data\plugins\astrbot_plugin_github_monitor")
-sys.path.insert(0, r"D:\astrbot\data\plugins")
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _PLUGIN_DIR)
+sys.path.insert(0, os.path.dirname(_PLUGIN_DIR))
 
 from main import GitHubMonitorPlugin, TIMEZONE_BJ  # noqa: E402
 
@@ -1082,6 +1083,46 @@ class TestDailyReport(unittest.TestCase):
         self.assertEqual(day["commits"], 1)
         self.assertEqual(day["releases"], 1)
         self.assertEqual(day["tags"], 1)
+
+
+class TestV131ProxyAndSubscribers(unittest.TestCase):
+    def test_session_trust_env_and_proxy_kwarg(self):
+        p = make_plugin(proxy="http://127.0.0.1:7890")
+        captured = {}
+
+        class ProxySess:
+            closed = False
+
+            def get(self, url, params=None, headers=None, **kwargs):
+                captured["kwargs"] = kwargs
+                return FakeResponse(200, {"ok": True})
+
+        p._session = ProxySess()
+        status, data = asyncio.run(p._gh_request("/user"))
+        self.assertEqual(status, 200)
+        self.assertEqual(captured["kwargs"], {"proxy": "http://127.0.0.1:7890"})
+
+    def test_send_skips_inactive_platforms(self):
+        from types import SimpleNamespace
+        sent = []
+
+        async def fake_send(session, chain):
+            sent.append(session)
+            if session.startswith("bad:"):
+                raise RuntimeError("")
+
+        p = make_plugin(default_subscribers="live:GroupMessage:1, dead:GroupMessage:2, bad:GroupMessage:3")
+        p.context = SimpleNamespace(
+            send_message=fake_send,
+            platform_manager=SimpleNamespace(
+                get_insts=lambda: [
+                    SimpleNamespace(metadata=SimpleNamespace(id="live")),
+                    SimpleNamespace(metadata=SimpleNamespace(id="bad")),
+                ]
+            ),
+        )
+        asyncio.run(p._send_to_subscribers("hello"))
+        self.assertEqual(sent, ["live:GroupMessage:1", "bad:GroupMessage:3"])
 
 
 if __name__ == "__main__":
