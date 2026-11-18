@@ -23,6 +23,7 @@ id_rsa*
 id_ed25519*
 *.token
 *secret*
+!secret.py
 
 # 编辑器
 .vscode/
