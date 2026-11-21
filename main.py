@@ -19,7 +19,12 @@ from astrbot.api.star import Context, Star, register
 PLUGIN_NAME = "astrbot_plugin_github_monitor"
 PLUGIN_AUTHOR = "云晓"
 PLUGIN_DESC = "监控 GitHub 仓库更新，自动推送到群聊与私聊"
-PLUGIN_VERSION = "1.3.1"
+try:
+    from .hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
+except ImportError:
+    from hub_bridge import HUB_PROTOCOL_VERSION, emit_hub_event
+
+PLUGIN_VERSION = "1.4.0"
 
 # GitHub API 基础地址与请求头
 GITHUB_API = "https://api.github.com"
@@ -45,6 +50,7 @@ _TREND_CHART_BARS = "▁▂▃▄▅▆▇█"
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, PLUGIN_DESC, PLUGIN_VERSION)
 class GitHubMonitorPlugin(Star):
+    HUB_PROTOCOL_VERSION = HUB_PROTOCOL_VERSION
     """GitHub 仓库监控插件"""
 
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -103,6 +109,23 @@ class GitHubMonitorPlugin(Star):
                 changed = True
         if changed:
             self._save_state()
+
+    def hub_status(self) -> dict:
+        repos = self._state.get("repos", {})
+        return {
+            "version": PLUGIN_VERSION,
+            "status": "online",
+            "metrics": {"监控仓库": len(repos), "订阅会话": len(self._subscribers()), "巡检运行": "是" if self._running else "否"},
+            "actions": ["list_repos", "trigger_check"],
+        }
+
+    async def hub_action(self, action: str, params: dict | None = None) -> dict:
+        if action == "list_repos":
+            return {"ok": True, "data": {"repos": sorted(self._state.get("repos", {}).keys()), "subscribers": len(self._subscribers())}}
+        if action == "trigger_check":
+            await self._broadcast_updates()
+            return {"ok": True, "data": {"checked": len(self._state.get("repos", {}))}}
+        return {"ok": False, "error": f"不支持的动作：{action}"}
 
     # ========== 状态持久化 ==========
 
@@ -940,6 +963,9 @@ class GitHubMonitorPlugin(Star):
                 if result:
                     msg = self._build_update_message(repo, result)
                     await self._send_to_subscribers(msg)
+                    subs = self._subscribers()
+                    ev_name = "github_monitor.release_found" if result.get("releases") else "github_monitor.update_found"
+                    emit_hub_event(PLUGIN_NAME, ev_name, {"repo": repo, "umo": subs[0] if subs else "", "summary": msg[:280]}, self.context)
                     await asyncio.sleep(0.5)  # 避免连续推送过快
             except Exception as e:
                 logger.error(f"检查仓库 {repo} 更新失败: {e}")
@@ -1032,6 +1058,8 @@ class GitHubMonitorPlugin(Star):
                 alert = self._record_star(repo, stars)
                 if alert:
                     alerts.append(alert)
+                    subs = self._subscribers()
+                    emit_hub_event(PLUGIN_NAME, "github_monitor.star_alert", {"repo": repo, "stars": stars, "umo": subs[0] if subs else "", "summary": alert[:280]}, self.context)
             except Exception as e:
                 logger.warning(f"记录 {repo} Star 趋势失败: {e}")
         if save:
